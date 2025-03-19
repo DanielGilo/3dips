@@ -15,6 +15,8 @@ from IPython.display import display, clear_output
 import matplotlib.pyplot as plt
 from torchvision.transforms.functional import pil_to_tensor
 import gc
+import wandb
+
 
 from dip.models import skip
 
@@ -48,7 +50,8 @@ def show_output_log():
     axs[2][0].set_ylabel("pred_z0")
 
     plt.tight_layout()
-    plt.show()
+    wandb.log({"output_log": fig})
+    #plt.show()
 
 
 @torch.no_grad()
@@ -102,6 +105,10 @@ def get_eps_prediction_cfg(unet, prediction_type, z_t: T, timestep: T, text_embe
     pred_z0 = (z_t - sigma_t * e_t) / alpha_t
     return e_t, pred_z0
 
+def get_timestep_linear_interp(i, num_iters, t_min, t_max):
+    i = max(i, 0)
+    t = int((1 - (i / num_iters)) * t_max + (i / num_iters) * t_min)
+    return t
 
 class DistillationLoss:
 
@@ -356,6 +363,81 @@ def turbo_sd(pipe, text_target, num_iters=200, guidance_scale=100, lr=1e-3):
     show_output_log()
 
 
+def ddim_like_optimization_loop(optimizer, num_iters, unet, student_pipe, embed_source, student_guidance_scale,
+                                teacher_guidance_scale, t_min, t_max, z_t, alphas, sigmas,alphas_cumprod, eta,
+                                embeddings_target, dds_loss, show_interval, wb):
+    T = torch.stack([torch.tensor(t_max)] * z_t.shape[0], dim=0).to(device)
+    timestep = T.clone()
+    alpha_t = alphas[T, None, None, None].clone().detach()
+    sigma_t = sigmas[T, None, None, None].clone().detach()
+    eta_0 = eta
+    for i in range(num_iters):
+        # prev timestep prediction
+        with torch.no_grad():
+            eps_t, pred_z0 = get_eps_prediction_cfg(unet, student_pipe.scheduler.config.prediction_type, z_t, timestep,
+                                                    embed_source,
+                                                    alpha_t, sigma_t, False, guidance_scale=student_guidance_scale)
+
+        # ddim forward (noising) step to new timestep
+        with torch.no_grad():
+            next_timestep = timestep.clone()  # timestep from prev iteration, "t + 1"
+            timestep = get_timestep_linear_interp(i, num_iters, t_min, t_max)  # new timestep, "t"
+            timestep = torch.stack([torch.tensor(timestep)] * z_t.shape[0], dim=0).to(device)
+            alpha_t = alphas[timestep, None, None, None]
+            sigma_t = sigmas[timestep, None, None, None]
+            z_t = alpha_t * pred_z0 + sigma_t * eps_t
+
+        # image prediction - this is "g(theta)" in SDS terms
+        eps_pred, z = get_eps_prediction_cfg(unet, student_pipe.scheduler.config.prediction_type, z_t, timestep,
+                                             embed_source, alpha_t,
+                                             sigma_t, False, guidance_scale=student_guidance_scale)
+
+        # adding stochasticity to the predicted noise, according to Eq. 12, 16 in https://arxiv.org/pdf/2010.02502 (DDIM paper).
+        # if eta > 0:
+        #     variance = student_pipe.scheduler._get_variance(next_timestep.to('cpu'), timestep.to('cpu')).to(device)
+        #     std_dev_t = eta * variance ** 0.5
+        #     direction_to_z_t_term = ((1 - alphas_cumprod[timestep] - std_dev_t ** 2) ** 0.5) * eps_pred
+        #     stochastic_term = std_dev_t * torch.randn_like(eps_pred)
+        #     eps = (direction_to_z_t_term + stochastic_term) / sigma_t
+        # else:
+        #     eps = eps_pred
+
+        if eta_0 > 0:
+            eta = np.exp(-20 * (i / num_iters)) * eta_0
+            eps = ((1 - eta) ** 0.5) * eps_pred + (eta ** 0.5) * torch.randn_like(eps_pred)
+        else:
+            eps = eps_pred
+
+        i_target = torch.randint(0, len(embeddings_target), size=(1,)).item()
+        loss, z_t, pred_z0, timestep = dds_loss.get_sds_loss(z, embeddings_target[i_target],
+                                                             guidance_scale=teacher_guidance_scale, eps=eps,
+                                                             timestep=timestep)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        wb.log({"loss": loss})
+        if (i + 1) % 50 == 0:
+            print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
+        if ((i % show_interval) == 0) or (i == (num_iters - 1)):
+            output_log["z"].append(z.detach())
+            output_log["z_t"].append(z_t.detach())
+            output_log["pred_z0"].append(pred_z0.detach())
+            output_log["t"].append(timestep.item())
+
+            wandb.log({"z": wandb.Image(decode(z.detach(), student_pipe), caption="z(t={})".format(timestep.item()))})
+            wandb.log({"z_t": wandb.Image(decode(z_t.detach(), student_pipe), caption="z_t(t={})".format(timestep.item()))})
+            wandb.log({"pred_z0": wandb.Image(decode(pred_z0.detach(), student_pipe), caption="pred_z0(t={})".format(timestep.item()))})
+
+            #out = decode(z, student_pipe, im_cat=None)
+            #plt.imshow(out);
+            #plt.show()
+
+    show_output_log()
+
 
 def SD(pipe, texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0):
     dds_loss = DistillationLoss(device, pipe)
@@ -372,20 +454,14 @@ def SD(pipe, texts_target, text_source, num_iters=200, guidance_scale=7.5, stude
     model_id = ["stabilityai/stable-diffusion-2-1"][0]
     student_pipe = AutoPipelineForText2Image.from_pretrained(model_id, ).to(device)
     unet, alphas, sigmas = init_pipe(device, torch.float32, student_pipe.unet, student_pipe.scheduler, unet_requires_grad=True)
-    alphas_cumprod = student_pipe.scheduler.alphas_cumprod.to(device, dtype=torch.float64)
-
+    alphas_cumprod = student_pipe.scheduler.alphas_cumprod.to(device)
     unet.requires_grad = True
     unet.train()
 
-    T = torch.stack([torch.tensor(999)] * z_source.shape[0], dim=0).to(device)
     embed = get_text_embeddings(student_pipe, text_source)
-
     embed_source = torch.stack([embedding_null, embed], dim=1)
 
-
     z_T = torch.randn_like(z_source, requires_grad=False).to(device)
-    alpha_t = alphas[T, None, None, None].clone().detach()
-    sigma_t = sigmas[T, None, None, None].clone().detach()
     del z_source
     del image_source
 
@@ -395,63 +471,21 @@ def SD(pipe, texts_target, text_source, num_iters=200, guidance_scale=7.5, stude
     t_max = 999
 
     z_t = z_T
-    timestep = T.clone()
-    for i in range(num_iters):
-        # prev timestep prediction
-        with torch.no_grad():
-            eps_t, pred_z0 = get_eps_prediction_cfg(unet, student_pipe.scheduler.config.prediction_type, z_t, timestep, embed_source,
-                                                    alpha_t, sigma_t, False, guidance_scale=student_guidance_scale)
-
-        # ddim forward (noising) step to new timestep
-        with torch.no_grad():
-            timestep = int((1 - (i / num_iters)) * t_max + (i / num_iters) * t_min)
-            timestep = torch.stack([torch.tensor(timestep)] * z_T.shape[0], dim=0).to(device)
-            alpha_t = alphas[timestep, None, None, None]
-            sigma_t = sigmas[timestep, None, None, None]
-            z_t = alpha_t * pred_z0 + sigma_t * eps_t
-
-        # image prediction - this is "g(theta)" in SDS terms
-        eps_pred, z = get_eps_prediction_cfg(unet, student_pipe.scheduler.config.prediction_type, z_t, timestep, embed_source, alpha_t,
-                                                    sigma_t, False, guidance_scale=student_guidance_scale)
-
-        # adding stochasticity to the predicted noise, according to Eq. 12 in https://arxiv.org/pdf/2010.02502 (DDIM paper).
-        # Using float64 precision to better reproduce the deterministic case, still not perfect due to rounding errors.
-        eta = torch.tensor(eta, dtype=torch.float64, device='cuda')
-        eps_pred = eps_pred.to(dtype=torch.float64)
-        sigma_t_64 = sigma_t.to(dtype=torch.float64)
-        direction_to_z_t_term = ((1 - alphas_cumprod[timestep] - eta**2) ** 0.5) * eps_pred
-        stochastic_term = eta * torch.randn_like(eps_pred)
-        eps = ((direction_to_z_t_term + stochastic_term) / sigma_t_64).to(dtype=torch.float32)
-
-        #eps = eps_pred.to(dtype=torch.float32)
-        i_target = torch.randint(0, len(texts_target), size=(1,)).item()
-        loss, z_t, pred_z0, timestep = dds_loss.get_sds_loss(z, embeddings_target[i_target], guidance_scale=guidance_scale, eps=eps,
-                                     timestep=timestep)
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    ddim_like_optimization_loop(optimizer, num_iters, unet, student_pipe, embed_source, student_guidance_scale,
+                                guidance_scale, t_min, t_max, z_t, alphas, sigmas, alphas_cumprod, eta, embeddings_target,
+                                dds_loss, show_interval)
 
 
-        if (i+ 1) % 50 == 0:
-            print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
-        if ((i % show_interval) == 0) or (i == (num_iters-1)):
-            output_log["z"].append(z.detach())
-            output_log["z_t"].append(z_t.detach())
-            output_log["pred_z0"].append(pred_z0.detach())
-            output_log["t"].append(timestep.item())
+def SD_lora(pipe, texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0):
+    config = {"texts_target": texts_target, "text_source": text_source, "num_iters": num_iters,
+                 "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta}
+    wb = wandb.init(
+        # Set the wandb project where this run will be logged.
+        project="3dips",
+        name="SD_LoRA",
+        config=config
+    )
 
-            out = decode(z, student_pipe, im_cat=None)
-            plt.imshow(out);
-            plt.show()
-
-    show_output_log()
-
-
-def SD_lora(pipe, text_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3):
     from peft import LoraConfig # keep here
     dds_loss = DistillationLoss(device, pipe)
     show_interval = int(num_iters / 10)
@@ -461,12 +495,13 @@ def SD_lora(pipe, text_target, text_source, num_iters=200, guidance_scale=7.5, s
     with torch.no_grad():
         z_source = pipeline.vae.encode(image_source)['latent_dist'].mean * pipeline.vae.config.scaling_factor
         embedding_null = get_text_embeddings(pipeline, "")
-        embedding_text_target = get_text_embeddings(pipeline, text_target)
-        embedding_target = torch.stack([embedding_null, embedding_text_target], dim=1)
+        embedding_text_targets = [get_text_embeddings(pipeline, text) for text in texts_target]
+        embeddings_target = [torch.stack([embedding_null, e], dim=1) for e in embedding_text_targets]
 
     model_id = ["stabilityai/stable-diffusion-2-1"][0]
     student_pipe = AutoPipelineForText2Image.from_pretrained(model_id, ).to(device)
     unet, alphas, sigmas = init_pipe(device, torch.float32, student_pipe.unet, student_pipe.scheduler, unet_requires_grad=False)
+    alphas_cumprod = student_pipe.scheduler.alphas_cumprod.to(device)
 
     unet_lora_config = LoraConfig(
         r=8,
@@ -477,14 +512,10 @@ def SD_lora(pipe, text_target, text_source, num_iters=200, guidance_scale=7.5, s
     unet.add_adapter(unet_lora_config)
     lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
     unet.train()
-
-    T = torch.stack([torch.tensor(999)] * z_source.shape[0], dim=0).to(device)
     embed = get_text_embeddings(student_pipe, text_source)
     embed_source = torch.stack([embedding_null, embed], dim=1)
 
     z_T = torch.randn_like(z_source, requires_grad=False).to(device)
-    alpha_t = alphas[T, None, None, None].clone().detach()
-    sigma_t = sigmas[T, None, None, None].clone().detach()
     del z_source
     del image_source
 
@@ -494,48 +525,10 @@ def SD_lora(pipe, text_target, text_source, num_iters=200, guidance_scale=7.5, s
     t_max = 999
 
     z_t = z_T
-    timestep = T.clone()
-    for i in range(num_iters):
-        # prev timestep prediction
-        with torch.no_grad():
-            eps_t, pred_z0 = get_eps_prediction_cfg(unet, student_pipe.scheduler.config.prediction_type, z_t, timestep, embed_source,
-                                                    alpha_t, sigma_t, False, guidance_scale=student_guidance_scale)
-
-        # ddim forward (noising) step to new timestep
-        with torch.no_grad():
-            timestep = int((1 - (i / num_iters)) * t_max + (i / num_iters) * t_min)
-            timestep = torch.stack([torch.tensor(timestep)] * z_T.shape[0], dim=0).to(device)
-            alpha_t = alphas[timestep, None, None, None]
-            sigma_t = sigmas[timestep, None, None, None]
-            z_t = alpha_t * pred_z0 + sigma_t * eps_t
-
-        eps_pred, z = get_eps_prediction_cfg(unet, student_pipe.scheduler.config.prediction_type, z_t, timestep, embed_source, alpha_t,
-                                                    sigma_t, False, guidance_scale=student_guidance_scale)
-
-        loss, z_t, pred_z0, timestep = dds_loss.get_sds_loss(z, embedding_target, guidance_scale=guidance_scale, eps=eps_pred,
-                                     timestep=timestep)
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-
-        if (i+ 1) % 50 == 0:
-            print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
-        if ((i % show_interval) == 0) or (i == (num_iters-1)):
-            output_log["z"].append(z.detach())
-            output_log["z_t"].append(z_t.detach())
-            output_log["pred_z0"].append(pred_z0.detach())
-            output_log["t"].append(timestep.item())
-
-            out = decode(z, student_pipe, im_cat=None)
-            plt.imshow(out);
-            plt.show()
-
-    show_output_log()
+    ddim_like_optimization_loop(optimizer, num_iters, unet, student_pipe, embed_source, student_guidance_scale,
+                                guidance_scale, t_min, t_max, z_t, alphas, sigmas, alphas_cumprod, eta,
+                                embeddings_target,
+                                dds_loss, show_interval, wb)
 
 
 
@@ -546,8 +539,8 @@ if __name__ == '__main__':
     set_deterministic_state()
     #image_optimization(pipeline,prompt, num_iters=3000, guidance_scale=100, lr=1e2)
     #turbo_sd(pipeline,prompt, num_iters=3000, guidance_scale=7.5, lr=1e-3)
-    SD(pipeline, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.05)
-    #SD_lora(pipeline, teacher_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-2)
+    #SD(pipeline, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0)
+    SD_lora(pipeline, teachers_prompt, student_prompt, num_iters=1000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-1, eta=1e-2)
     #deep_image_prior(pipeline, prompt, num_iters=10000)
     #deep_image_prior_test(pipeline,prompt, num_iters=3000)
 
