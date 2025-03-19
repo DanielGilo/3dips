@@ -484,7 +484,7 @@ def SD_lora(pipe, texts_target, text_source, num_iters=200, guidance_scale=7.5, 
         project="3dips",
         name="SD_LoRA",
         config=config
-    )
+    ); wb.log_code()
 
     from peft import LoraConfig # keep here
     dds_loss = DistillationLoss(device, pipe)
