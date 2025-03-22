@@ -1,45 +1,38 @@
-# adapted from Delta Denoising Score code: https://github.com/google/prompt-to-prompt/blob/main/DDS_zeroshot.ipynb
-
 from typing import Tuple, Union, Optional, List
 
 import torch
 import torch.nn as nn
 from torch.optim.adamw import AdamW
 from torch.optim.sgd import SGD
-from torch.optim import lr_scheduler
-from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoPipelineForText2Image
 import numpy as np
-from PIL import Image
-from tqdm.notebook import tqdm
-from IPython.display import display, clear_output
+from diffusers import StableDiffusionPipeline
+
 import matplotlib.pyplot as plt
-from torchvision.transforms.functional import pil_to_tensor
 import gc
 import wandb
 
+import students
+import teachers
+import losses
 
-from dip.models import skip
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] =":4096:8" # necessary when setting torch.use_dererministic_algorithms(True)
 
-T = torch.Tensor
-TN = Optional[T]
-TS = Union[Tuple[T, ...], List[T]]
-
 device = torch.device('cuda:0')
 
 output_log = {"z": [], "z_t": [], "pred_z0": [], "t": []}
 
-def show_output_log():
+
+def show_output_log(wandb, model):
     nrows = len(output_log.keys()) - 1
     ncols = len(output_log["z"])
     fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(11, 3))
     for col_i in range(ncols):
-        axs[0][col_i].imshow(decode(output_log["z"][col_i], pipeline))
-        axs[1][col_i].imshow(decode(output_log["z_t"][col_i], pipeline))
-        axs[2][col_i].imshow(decode(output_log["pred_z0"][col_i], pipeline))
+        axs[0][col_i].imshow(model.decode(output_log["z"][col_i]))
+        axs[1][col_i].imshow(model.decode(output_log["z_t"][col_i]))
+        axs[2][col_i].imshow(model.decode(output_log["pred_z0"][col_i]))
 
         [axs[row_i][col_i].set_xticks([]) for row_i in range(nrows)]
         [axs[row_i][col_i].set_yticks([]) for row_i in range(nrows)]
@@ -54,157 +47,41 @@ def show_output_log():
     #plt.show()
 
 
-@torch.no_grad()
-def get_text_embeddings(pipe: StableDiffusionPipeline, text: str) -> T:
-    tokens = pipe.tokenizer([text], padding="max_length", max_length=77, truncation=True,
-                                   return_tensors="pt", return_overflowing_tokens=True).input_ids.to(device)
-    return pipe.text_encoder(tokens).last_hidden_state.detach()
-
-@torch.no_grad()
-def denormalize(image):
-    image = (image / 2 + 0.5).clamp(0, 1)
-    image = image.cpu().permute(0, 2, 3, 1).numpy()
-    image = (image * 255).astype(np.uint8)
-    return image[0]
-
-
-@torch.no_grad()
-def decode(latent: T, pipe: StableDiffusionPipeline, im_cat: TN = None):
-    image = pipeline.vae.decode((1 / 0.18215) * latent, return_dict=False)[0]
-    image = denormalize(image)
-    if im_cat is not None:
-        image = np.concatenate((im_cat, image), axis=1)
-    return Image.fromarray(image)
-
-
-def init_pipe(device, dtype, unet, scheduler, unet_requires_grad=False) -> Tuple[UNet2DConditionModel, T, T]:
-    with torch.inference_mode():
-        alphas = torch.sqrt(scheduler.alphas_cumprod).to(device, dtype=dtype)
-        sigmas = torch.sqrt(1 - scheduler.alphas_cumprod).to(device, dtype=dtype)
-    if not unet_requires_grad:
-        for p in unet.parameters():
-            p.requires_grad = False
-    return unet, alphas, sigmas
-
-def get_eps_prediction_cfg(unet, prediction_type, z_t: T, timestep: T, text_embeddings: T, alpha_t: T, sigma_t: T,
-                           get_raw=False, guidance_scale=7.5):
-    latent_input = torch.cat([z_t] * 2)
-    timestep = torch.cat([timestep] * 2)
-    embedd = text_embeddings.permute(1, 0, 2, 3).reshape(-1, *text_embeddings.shape[2:])
-    with torch.autocast(device_type="cuda", dtype=torch.float16):
-        e_t = unet(latent_input, timestep, embedd).sample
-        if prediction_type == 'v_prediction':
-            e_t = torch.cat([alpha_t] * 2) * e_t + torch.cat([sigma_t] * 2) * latent_input
-        e_t_uncond, e_t = e_t.chunk(2)
-        if get_raw:
-            return e_t_uncond, e_t
-        e_t = e_t_uncond + guidance_scale * (e_t - e_t_uncond)
-        assert torch.isfinite(e_t).all()
-    if get_raw:
-        return e_t
-    pred_z0 = (z_t - sigma_t * e_t) / alpha_t
-    return e_t, pred_z0
-
 def get_timestep_linear_interp(i, num_iters, t_min, t_max):
     i = max(i, 0)
     t = int((1 - (i / num_iters)) * t_max + (i / num_iters) * t_min)
     return t
 
-class DistillationLoss:
-
-    def noise_input(self, z, eps=None, timestep: Optional[int] = None):
-        if timestep is None:
-            b = z.shape[0]
-            timestep = torch.randint(
-                low=self.t_min,
-                high=min(self.t_max, 1000) - 1,  # Avoid the highest timestep.
-                size=(b,),
-                device=z.device, dtype=torch.long)
-        if eps is None:
-            eps = torch.randn_like(z)
-        alpha_t = self.alphas[timestep, None, None, None]
-        sigma_t = self.sigmas[timestep, None, None, None]
-        z_t = alpha_t * z + sigma_t * eps
-        return z_t, eps, timestep, alpha_t, sigma_t
-
-    def get_eps_prediction(self, z_t: T, timestep: T, text_embeddings: T, alpha_t: T, sigma_t: T, get_raw=False,
-                           guidance_scale=7.5):
-        return get_eps_prediction_cfg(self.unet, self.prediction_type, z_t, timestep, text_embeddings, alpha_t,
-                                      sigma_t, get_raw=get_raw, guidance_scale=guidance_scale)
-
-    def get_loss_distill(self, z, text_embeddings, guidance_scale):
-        with torch.inference_mode():
-            z_t, eps, timestep, alpha_t, sigma_t = self.noise_input(z, eps=None, timestep=None)
-            e_t, pred_z0 = self.get_eps_prediction(z_t, timestep, text_embeddings, alpha_t, sigma_t,
-                                             guidance_scale=guidance_scale)
-            assert torch.isfinite(pred_z0).all()
-            pred_z0 = torch.nan_to_num(pred_z0.detach(), 0.0, 0.0, 0.0)
-        w_t = (alpha_t.detach().clone() ** self.alpha_exp) * (sigma_t.detach().clone() ** self.sigma_exp)
-        residual = ((z - pred_z0.detach().clone()) ** 2)
-        assert torch.isfinite(residual).all()
-        loss_distill = w_t * residual
-
-        return loss_distill.sum() / (z.shape[2] * z.shape[3])
-
-
-    # from DreamFusion appendix A1: sds_loss(x) = weight(t) * dot(stopgrad[epshat_t - eps], x) where x = g(theta)
-    # and its grad is the known formula: weight(t) * (epshat_t - eps) * grad(x)
-    def get_sds_loss(self, z: T, text_embeddings: T, guidance_scale, eps=None, timestep=None) -> T:
-        with torch.inference_mode():
-            z_t, eps, timestep, alpha_t, sigma_t = self.noise_input(z, eps=eps, timestep=timestep)
-            e_t, pred_z0 = self.get_eps_prediction(z_t, timestep, text_embeddings, alpha_t, sigma_t,
-                                             guidance_scale=guidance_scale)
-            w_t = (alpha_t ** self.alpha_exp) * (sigma_t ** self.sigma_exp)
-            grad_z = w_t * (e_t - eps)
-            assert torch.isfinite(grad_z).all()
-            grad_z = torch.nan_to_num(grad_z.detach(), 0.0, 0.0, 0.0)
-        sds_loss = grad_z.clone() * z
-        del grad_z
-        sds_loss = sds_loss.sum() / (z.shape[2] * z.shape[3]) # Daniel: normalization is necessary to avoid exploding grads
-
-        return sds_loss, z_t, pred_z0, timestep
-
-    def __init__(self, device, pipe: StableDiffusionPipeline, dtype=torch.float32):
-        self.t_min = 50
-        self.t_max = 950
-        self.alpha_exp = 0
-        self.sigma_exp = 0
-        self.dtype = dtype
-        self.unet, self.alphas, self.sigmas = init_pipe(device, dtype, pipe.unet, pipe.scheduler)
-        self.prediction_type = pipe.scheduler.config.prediction_type
-
-
-
-model_id  =  ["stabilityai/stable-diffusion-2-1"][0]
-pipeline = StableDiffusionPipeline.from_pretrained(model_id,).to(device)
 
 def set_deterministic_state():
     torch.manual_seed(0)
     torch.use_deterministic_algorithms(True)
 
 
-def image_optimization(pipe: StableDiffusionPipeline, text_target: str, num_iters=200, guidance_scale=7.5, lr=1e-1) -> None:
-    dds_loss = DistillationLoss(device, pipe)
+def image_optimization(text_target, num_iters=200, guidance_scale=7.5, lr=1e-1):
+    config = {"text_target": text_target,  "num_iters": num_iters,
+              "teacher_guidance_scale": guidance_scale, "lr": lr}
+    wb = wandb.init(
+        project="3dips",
+        name="blank_canvas",
+        config=config
+    );
+    wb.log_code()
     show_interval = int(num_iters / 10)
 
-    # image_source = torch.from_numpy(image).float().permute(2, 0, 1) / 127.5 - 1
-    image_source = torch.rand((512,512,3)).float().permute(2, 0, 1) * 2.0 - 1.0
-    image_source = image_source.unsqueeze(0).to(device)
-    with torch.no_grad():
-        z_source = pipeline.vae.encode(image_source)['latent_dist'].mean * pipeline.vae.config.scaling_factor
-        image_target = image_source.clone()
-        embedding_null = get_text_embeddings(pipeline, "")
-        embedding_text_target = get_text_embeddings(pipeline, text_target)
-        embedding_target = torch.stack([embedding_null, embedding_text_target], dim=1)
+    latent_shape = (1,4,64,64)
+    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    student = students.BlankCanvasStudent(latent_shape=latent_shape, device=device)
 
-    image_target.requires_grad = False
-
-    z_target = z_source.clone()
-    z_target.requires_grad = True
-    optimizer = SGD(params=[z_target], lr=lr)
+    text_embeddings = torch.stack([teacher.get_text_embeddings(""), teacher.get_text_embeddings(text_target)], dim=1)
+    optimizer = SGD(params=student.get_trainable_params(), lr=lr)
 
     for i in range(num_iters):
-        loss, z_t, pred_z0, timestep = dds_loss.get_sds_loss(z_target, embedding_target, guidance_scale=guidance_scale)
+        z0_student = student.predict_sample()
+        eps = torch.randn(latent_shape, device=device)
+        timestep = torch.randint(low=50, high=950,size=(latent_shape[0],), device=device, dtype=torch.long)
+        w_t = 1
+        loss, z_t, pred_z0 = losses.get_sds_loss(z0_student, teacher, text_embeddings, guidance_scale, eps, timestep, w_t)
         optimizer.zero_grad()
         loss.backward()  #used to be (2000 * loss).backward()
         optimizer.step()
@@ -212,136 +89,49 @@ def image_optimization(pipe: StableDiffusionPipeline, text_target: str, num_iter
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
 
         if i % show_interval == 0:
-            output_log["z"].append(z_target.clone().detach())
+            output_log["z"].append(z0_student.clone().detach())
             output_log["z_t"].append(z_t.detach())
             output_log["pred_z0"].append(pred_z0.detach())
             output_log["t"].append(timestep.item())
 
-            out = decode(z_target, pipeline, im_cat=None)
+            out = teacher.decode(z0_student)
             plt.imshow(out); plt.show()
-    show_output_log()
+    show_output_log(wb, teacher)
 
 
-def deep_image_prior(pipe, text_target, num_iters=200, guidance_scale=100):
-    dds_loss = DistillationLoss(device, pipe)
-
-    image_source = torch.rand((512, 512, 3)).float().permute(2, 0, 1) * 2.0 - 1.0
-    image_source = image_source.unsqueeze(0).to(device)
-    with torch.no_grad():
-        z_source = pipeline.vae.encode(image_source)['latent_dist'].mean * pipeline.vae.config.scaling_factor
-        embedding_null = get_text_embeddings(pipeline, "")
-        embedding_text_target = get_text_embeddings(pipeline, text_target)
-        embedding_target = torch.stack([embedding_null, embedding_text_target], dim=1)
-
-    z_source.requires_grad = False
-
-    net = skip(
-        z_source.shape[1], z_source.shape[1],
-        num_channels_down=[8, 16, 32, 64, 128],
-        num_channels_up=[8, 16, 32, 64, 128],
-        num_channels_skip=[0, 0, 0, 4, 4],
-        upsample_mode='bilinear',
-        need_sigmoid=False, need_bias=True, pad='reflection', act_fun='LeakyReLU').to(device)
-    net.requires_grad = True
-    #optimizer = SGD(params=net.parameters(), lr=1e-2)
-    optimizer = AdamW(params=net.parameters(), lr=1e-5)
-
-    for i in range(num_iters):
-        z_target = net(z_source)
-        loss = dds_loss.get_sds_loss(z_target, embedding_target, guidance_scale=guidance_scale)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if (i+ 1) % 500 == 0:
-            print("iteration: {}/{}, abs loss: {}".format(i + 1, num_iters, abs(loss.item())))
-        if (i + 1) % 1000 == 0:
-            # out = decode(z_taregt, pipeline, im_cat=image)
-            out = decode(z_target, pipeline, im_cat=None)
-            plt.imshow(out); plt.colorbar()
-            #plt.imshow(z_target[0,0,...].detach().cpu().numpy()); plt.colorbar()
-            plt.show()
-
-
-def deep_image_prior_test(pipe, prompt, num_iters):
-    target_image = pil_to_tensor(pipe(prompt=prompt, guidance_scale=7.5).images[0]) / 255
-    target_image = torch.unsqueeze(target_image, 0).to(device)
-    seed = torch.rand(target_image.shape).to(device)
-
-    net = skip(
-        target_image.shape[1], target_image.shape[1],
-        num_channels_down=[8, 16, 32, 64, 128],
-        num_channels_up=[8, 16, 32, 64, 128],
-        num_channels_skip=[0, 0, 0, 4, 4],
-        upsample_mode='bilinear',
-        need_sigmoid=True, need_bias=True, pad='reflection', act_fun='LeakyReLU').to(device)
-
-    net.requires_grad = True
-    target_image.requires_grad = False
-    seed.requires_grad = False
-
-    optimizer = SGD(params=net.parameters(), lr=1e-2)
-
-    loss_fn = nn.MSELoss(reduction='mean')
-    for i in range(num_iters):
-        loss = loss_fn(net(seed), target_image)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if (i + 1) % 100 == 0:
-            print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
-        if (i + 1) % 500 == 0:
-            # out = decode(z_taregt, pipeline, im_cat=image)
-            plt.imshow(net(seed)[0].permute(1,2,0).detach().cpu().numpy())
-            plt.show()
-
-
-def turbo_sd(pipe, text_target, num_iters=200, guidance_scale=100, lr=1e-3):
-    dds_loss = DistillationLoss(device, pipe)
+def turbo_sd(text_target, num_iters=200, guidance_scale=100, lr=1e-3):
+    config = {"text_target": text_target, "num_iters": num_iters,
+              "teacher_guidance_scale": guidance_scale, "lr": lr}
+    wb = wandb.init(
+        project="3dips",
+        name="Turbo_SD",
+        config=config
+    );
+    wb.log_code()
     show_interval = int(num_iters / 10)
+    latent_shape = (1, 4, 64, 64)
+    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    student = students.SDStudent(model_id="stabilityai/sd-turbo", device=device, dtype=torch.float32)
+    teacher_embeddings = torch.stack([teacher.get_text_embeddings(""), teacher.get_text_embeddings(text_target)], dim=1)
+    student_embeddings = torch.stack([student.get_text_embeddings(""), student.get_text_embeddings("")], dim=1) # embeddings should be identical
 
-    image_source = torch.rand((512, 512, 3)).float().permute(2, 0, 1) * 2.0 - 1.0
-    image_source = image_source.unsqueeze(0).to(device)
-    with torch.no_grad():
-        z_source = pipeline.vae.encode(image_source)['latent_dist'].mean * pipeline.vae.config.scaling_factor
-        embedding_null = get_text_embeddings(pipeline, "")
-        embedding_text_target = get_text_embeddings(pipeline, text_target)
-        embedding_target = torch.stack([embedding_null, embedding_text_target], dim=1)
-
-    model_id = ["stabilityai/sd-turbo"][0]
-    sd_turbo_pipe = AutoPipelineForText2Image.from_pretrained(model_id, ).to(device)
-    unet, alphas, sigmas = init_pipe(device, torch.float32, sd_turbo_pipe.unet, sd_turbo_pipe.scheduler, unet_requires_grad=True)
-
-    unet.requires_grad = True
-    unet.train()
-
-    T = torch.stack([torch.tensor(999)] * z_source.shape[0], dim=0).to(device)
-    embed = get_text_embeddings(sd_turbo_pipe, "")
-    #embed = get_text_embeddings(sd_turbo_pipe, "The style of Van Gogh")
-
-    torch.manual_seed(0)
-    z_T = torch.randn_like(z_source, requires_grad=False).to(device)
-    alpha_T = alphas[T, None, None, None].clone().detach()
-    sigma_T = sigmas[T, None, None, None].clone().detach()
-    del z_source
-    del image_source
-
-    optimizer = SGD(params=unet.parameters(), lr=lr)
-    #optimizer = SGD(params=[z_T], lr=1e-1)
+    optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
 
     t_min = 50
     t_max = 999
+    z_T = torch.randn(latent_shape, device=device, dtype=torch.float32)
+    T = torch.stack([torch.tensor(t_max)] * latent_shape[0], dim=0).to(device)
 
     for i in range(num_iters):
-        eps_pred = unet(z_T, timestep=T, encoder_hidden_states=embed).sample
-        z = (z_T - sigma_T * eps_pred) / alpha_T
+        eps_pred, z0_student = student.predict_eps_and_sample(z_T, T, 0.0, text_embeddings=student_embeddings)
 
         t_min_ = int((1 - (i/num_iters)) * t_max + (i/num_iters) * t_min)
-        #timestep = int((1 - (i/num_iters)) * t_max + (i/num_iters) * t_min)
-        timestep = torch.randint(low=t_min_, high=1000, size=(1,)).item()
-        timestep = torch.stack([torch.tensor(timestep)] * z.shape[0], dim=0).to(device)
+        timestep = torch.randint(low=t_min_, high=t_max+1, size=(1,)).item()
+        timestep = torch.stack([torch.tensor(timestep)] * z0_student.shape[0], dim=0).to(device)
+        w_t = 1
 
-        loss, z_t, pred_z0, timestep = dds_loss.get_sds_loss(z, embedding_target, guidance_scale=guidance_scale, eps=eps_pred,
-                                     timestep=timestep)
+        loss, z_t, pred_z0 = losses.get_sds_loss(z0_student, teacher, teacher_embeddings, guidance_scale,
+                                                           eps_pred, timestep, w_t)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -352,45 +142,44 @@ def turbo_sd(pipe, text_target, num_iters=200, guidance_scale=100, lr=1e-3):
         if (i+ 1) % 50 == 0:
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
         if ((i % show_interval) == 0) or (i == (num_iters-1)):
-            output_log["z"].append(z.detach())
+            output_log["z"].append(z0_student.detach())
             output_log["z_t"].append(z_t.detach())
             output_log["pred_z0"].append(pred_z0.detach())
             output_log["t"].append(timestep.item())
 
-            out = decode(z, sd_turbo_pipe, im_cat=None)
+            out = student.decode(z0_student)
             plt.imshow(out);
             plt.show()
-    show_output_log()
+    show_output_log(wb, student)
 
 
-def ddim_like_optimization_loop(optimizer, num_iters, unet, student_pipe, embed_source, student_guidance_scale,
-                                teacher_guidance_scale, t_min, t_max, z_t, alphas, sigmas,alphas_cumprod, eta,
-                                embeddings_target, dds_loss, show_interval, wb):
+def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, student_guidance_scale,
+                                teacher, teachers_prompts, teacher_guidance_scale, t_min, t_max, z_t, eta,
+                                show_interval, wb):
+    with torch.no_grad():
+        embedding_null = teacher.get_text_embeddings("")
+        embeddings_text_teacher = [teacher.get_text_embeddings(text) for text in teachers_prompts]
+        teacher_texts_embeddings = [torch.stack([embedding_null, e], dim=1) for e in embeddings_text_teacher]
+        student_text_embeddings = torch.stack([student.get_text_embeddings(""), student.get_text_embeddings(student_prompt)],
+                                     dim=1)
+
     T = torch.stack([torch.tensor(t_max)] * z_t.shape[0], dim=0).to(device)
     timestep = T.clone()
-    alpha_t = alphas[T, None, None, None].clone().detach()
-    sigma_t = sigmas[T, None, None, None].clone().detach()
     eta_0 = eta
     for i in range(num_iters):
         # prev timestep prediction
         with torch.no_grad():
-            eps_t, pred_z0 = get_eps_prediction_cfg(unet, student_pipe.scheduler.config.prediction_type, z_t, timestep,
-                                                    embed_source,
-                                                    alpha_t, sigma_t, False, guidance_scale=student_guidance_scale)
+            eps_t, pred_z0 = student.predict_eps_and_sample(z_t, timestep, student_guidance_scale, student_text_embeddings)
 
         # ddim forward (noising) step to new timestep
         with torch.no_grad():
             next_timestep = timestep.clone()  # timestep from prev iteration, "t + 1"
             timestep = get_timestep_linear_interp(i, num_iters, t_min, t_max)  # new timestep, "t"
             timestep = torch.stack([torch.tensor(timestep)] * z_t.shape[0], dim=0).to(device)
-            alpha_t = alphas[timestep, None, None, None]
-            sigma_t = sigmas[timestep, None, None, None]
-            z_t = alpha_t * pred_z0 + sigma_t * eps_t
+            z_t = student.noise_to_timestep(pred_z0, timestep, eps_t)
 
         # image prediction - this is "g(theta)" in SDS terms
-        eps_pred, z = get_eps_prediction_cfg(unet, student_pipe.scheduler.config.prediction_type, z_t, timestep,
-                                             embed_source, alpha_t,
-                                             sigma_t, False, guidance_scale=student_guidance_scale)
+        eps_pred, z0_student = student.predict_eps_and_sample(z_t, timestep, student_guidance_scale, student_text_embeddings)
 
         # adding stochasticity to the predicted noise, according to Eq. 12, 16 in https://arxiv.org/pdf/2010.02502 (DDIM paper).
         # if eta > 0:
@@ -408,10 +197,10 @@ def ddim_like_optimization_loop(optimizer, num_iters, unet, student_pipe, embed_
         else:
             eps = eps_pred
 
-        i_target = torch.randint(0, len(embeddings_target), size=(1,)).item()
-        loss, z_t, pred_z0, timestep = dds_loss.get_sds_loss(z, embeddings_target[i_target],
-                                                             guidance_scale=teacher_guidance_scale, eps=eps,
-                                                             timestep=timestep)
+        i_target = torch.randint(0, len(teacher_texts_embeddings), size=(1,)).item()
+        w_t = 1
+        loss, z_t, pred_z0 = losses.get_sds_loss(z0_student, teacher, teacher_texts_embeddings[i_target],
+                                                           teacher_guidance_scale, eps, timestep, w_t)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -423,60 +212,47 @@ def ddim_like_optimization_loop(optimizer, num_iters, unet, student_pipe, embed_
         if (i + 1) % 50 == 0:
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
         if ((i % show_interval) == 0) or (i == (num_iters - 1)):
-            output_log["z"].append(z.detach())
+            output_log["z"].append(z0_student.detach())
             output_log["z_t"].append(z_t.detach())
             output_log["pred_z0"].append(pred_z0.detach())
             output_log["t"].append(timestep.item())
 
-            wandb.log({"z": wandb.Image(decode(z.detach(), student_pipe), caption="z(t={})".format(timestep.item()))})
-            wandb.log({"z_t": wandb.Image(decode(z_t.detach(), student_pipe), caption="z_t(t={})".format(timestep.item()))})
-            wandb.log({"pred_z0": wandb.Image(decode(pred_z0.detach(), student_pipe), caption="pred_z0(t={})".format(timestep.item()))})
+            wb.log({"z": wandb.Image(student.decode(z0_student.detach()), caption="z(t={})".format(timestep.item()))})
+            wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach()), caption="z_t(t={})".format(timestep.item()))})
+            wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
 
-            #out = decode(z, student_pipe, im_cat=None)
-            #plt.imshow(out);
-            #plt.show()
+            out = student.decode(z0_student)
+            plt.imshow(out);
+            plt.show()
 
-    show_output_log()
+    show_output_log(wb, student)
 
 
-def SD(pipe, texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0):
-    dds_loss = DistillationLoss(device, pipe)
+def SD(texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0):
+    config = {"texts_target": texts_target, "text_source": text_source, "num_iters": num_iters,
+              "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta}
+    wb = wandb.init(
+        project="3dips",
+        name="SD",
+        config=config
+    ); wb.log_code()
     show_interval = int(num_iters / 10)
 
-    image_source = torch.rand((512, 512, 3)).float().permute(2, 0, 1) * 2.0 - 1.0
-    image_source = image_source.unsqueeze(0).to(device)
-    with torch.no_grad():
-        z_source = pipeline.vae.encode(image_source)['latent_dist'].mean * pipeline.vae.config.scaling_factor
-        embedding_null = get_text_embeddings(pipeline, "")
-        embedding_text_targets = [get_text_embeddings(pipeline, text) for text in texts_target]
-        embeddings_target = [torch.stack([embedding_null, e], dim=1) for e in embedding_text_targets]
+    latent_shape = (1, 4, 64, 64)
+    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    student = students.SDStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
 
-    model_id = ["stabilityai/stable-diffusion-2-1"][0]
-    student_pipe = AutoPipelineForText2Image.from_pretrained(model_id, ).to(device)
-    unet, alphas, sigmas = init_pipe(device, torch.float32, student_pipe.unet, student_pipe.scheduler, unet_requires_grad=True)
-    alphas_cumprod = student_pipe.scheduler.alphas_cumprod.to(device)
-    unet.requires_grad = True
-    unet.train()
-
-    embed = get_text_embeddings(student_pipe, text_source)
-    embed_source = torch.stack([embedding_null, embed], dim=1)
-
-    z_T = torch.randn_like(z_source, requires_grad=False).to(device)
-    del z_source
-    del image_source
-
-    optimizer = SGD(params=unet.parameters(), lr=lr)
-
+    optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
     t_min = 20
     t_max = 999
 
-    z_t = z_T
-    ddim_like_optimization_loop(optimizer, num_iters, unet, student_pipe, embed_source, student_guidance_scale,
-                                guidance_scale, t_min, t_max, z_t, alphas, sigmas, alphas_cumprod, eta, embeddings_target,
-                                dds_loss, show_interval)
+    z_t = torch.randn(latent_shape, device=device, dtype=torch.float32, requires_grad=False)
+    ddim_like_optimization_loop(optimizer, num_iters, student, text_source, student_guidance_scale,
+                                teacher, texts_target, guidance_scale, t_min, t_max, z_t, eta,
+                                show_interval, wb)
 
 
-def SD_lora(pipe, texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0):
+def SD_lora(texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0):
     config = {"texts_target": texts_target, "text_source": text_source, "num_iters": num_iters,
                  "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta}
     wb = wandb.init(
@@ -486,49 +262,19 @@ def SD_lora(pipe, texts_target, text_source, num_iters=200, guidance_scale=7.5, 
         config=config
     ); wb.log_code()
 
-    from peft import LoraConfig # keep here
-    dds_loss = DistillationLoss(device, pipe)
     show_interval = int(num_iters / 10)
+    latent_shape = (1, 4, 64, 64)
+    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    student = students.SDLoRAStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
 
-    image_source = torch.rand((512, 512, 3)).float().permute(2, 0, 1) * 2.0 - 1.0
-    image_source = image_source.unsqueeze(0).to(device)
-    with torch.no_grad():
-        z_source = pipeline.vae.encode(image_source)['latent_dist'].mean * pipeline.vae.config.scaling_factor
-        embedding_null = get_text_embeddings(pipeline, "")
-        embedding_text_targets = [get_text_embeddings(pipeline, text) for text in texts_target]
-        embeddings_target = [torch.stack([embedding_null, e], dim=1) for e in embedding_text_targets]
-
-    model_id = ["stabilityai/stable-diffusion-2-1"][0]
-    student_pipe = AutoPipelineForText2Image.from_pretrained(model_id, ).to(device)
-    unet, alphas, sigmas = init_pipe(device, torch.float32, student_pipe.unet, student_pipe.scheduler, unet_requires_grad=False)
-    alphas_cumprod = student_pipe.scheduler.alphas_cumprod.to(device)
-
-    unet_lora_config = LoraConfig(
-        r=8,
-        lora_alpha=8,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-    )
-    unet.add_adapter(unet_lora_config)
-    lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
-    unet.train()
-    embed = get_text_embeddings(student_pipe, text_source)
-    embed_source = torch.stack([embedding_null, embed], dim=1)
-
-    z_T = torch.randn_like(z_source, requires_grad=False).to(device)
-    del z_source
-    del image_source
-
-    optimizer = SGD(params=lora_layers, lr=lr)
-
-    t_min = 50
+    optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
+    t_min = 20
     t_max = 999
 
-    z_t = z_T
-    ddim_like_optimization_loop(optimizer, num_iters, unet, student_pipe, embed_source, student_guidance_scale,
-                                guidance_scale, t_min, t_max, z_t, alphas, sigmas, alphas_cumprod, eta,
-                                embeddings_target,
-                                dds_loss, show_interval, wb)
+    z_t = torch.randn(latent_shape, device=device, dtype=torch.float32, requires_grad=False)
+    ddim_like_optimization_loop(optimizer, num_iters, student, text_source, student_guidance_scale,
+                                teacher, texts_target, guidance_scale, t_min, t_max, z_t, eta,
+                                show_interval, wb)
 
 
 
@@ -537,10 +283,8 @@ if __name__ == '__main__':
     #student_prompt = "A photorealistic image of a man in the beach"
     student_prompt = ""
     set_deterministic_state()
-    #image_optimization(pipeline,prompt, num_iters=3000, guidance_scale=100, lr=1e2)
-    #turbo_sd(pipeline,prompt, num_iters=3000, guidance_scale=7.5, lr=1e-3)
-    #SD(pipeline, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0)
-    SD_lora(pipeline, teachers_prompt, student_prompt, num_iters=1000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-1, eta=1e-2)
-    #deep_image_prior(pipeline, prompt, num_iters=10000)
-    #deep_image_prior_test(pipeline,prompt, num_iters=3000)
+    #image_optimization(pipeline,teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2)
+    #turbo_sd(teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-3)
+    #SD(teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0)
+    SD_lora(teachers_prompt, student_prompt, num_iters=1000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-1, eta=1e-2)
 
