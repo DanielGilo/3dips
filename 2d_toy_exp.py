@@ -1,8 +1,4 @@
-from typing import Tuple, Union, Optional, List
-
 import torch
-import torch.nn as nn
-from torch.optim.adamw import AdamW
 from torch.optim.sgd import SGD
 import numpy as np
 import PIL
