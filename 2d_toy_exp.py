@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.optim.adamw import AdamW
 from torch.optim.sgd import SGD
 import numpy as np
-from diffusers import StableDiffusionPipeline
+import PIL
 
 import matplotlib.pyplot as plt
 import gc
@@ -44,7 +44,7 @@ def show_output_log(wandb, model):
 
     plt.tight_layout()
     wandb.log({"output_log": fig})
-    #plt.show()
+    plt.show()
 
 
 def get_timestep_linear_interp(i, num_iters, t_min, t_max):
@@ -70,7 +70,12 @@ def image_optimization(text_target, num_iters=200, guidance_scale=7.5, lr=1e-1):
     show_interval = int(num_iters / 10)
 
     latent_shape = (1,4,64,64)
-    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    #teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+
+    init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
+    mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
+    teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
+                                         model_id="runwayml/stable-diffusion-inpainting", device=device, dtype=torch.float32)
     student = students.BlankCanvasStudent(latent_shape=latent_shape, device=device)
 
     text_embeddings = torch.stack([teacher.get_text_embeddings(""), teacher.get_text_embeddings(text_target)], dim=1)
@@ -110,7 +115,13 @@ def turbo_sd(text_target, num_iters=200, guidance_scale=100, lr=1e-3):
     wb.log_code()
     show_interval = int(num_iters / 10)
     latent_shape = (1, 4, 64, 64)
-    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    #teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
+    mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
+    teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
+                                         model_id="runwayml/stable-diffusion-inpainting", device=device,
+                                         dtype=torch.float32)
+
     student = students.SDStudent(model_id="stabilityai/sd-turbo", device=device, dtype=torch.float32)
     teacher_embeddings = torch.stack([teacher.get_text_embeddings(""), teacher.get_text_embeddings(text_target)], dim=1)
     student_embeddings = torch.stack([student.get_text_embeddings(""), student.get_text_embeddings("")], dim=1) # embeddings should be identical
@@ -279,12 +290,13 @@ def SD_lora(texts_target, text_source, num_iters=200, guidance_scale=7.5, studen
 
 
 if __name__ == '__main__':
-    teachers_prompt = ["a photorealistic image of a man on a horse"]
+    #teachers_prompt = ["a photorealistic image of a man on a horse"]
+    teachers_prompt = ["a photo of a cat sitting on a bench, facing the camera, high resolution"]
     #student_prompt = "A photorealistic image of a man in the beach"
     student_prompt = ""
     set_deterministic_state()
-    #image_optimization(pipeline,teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2)
-    #turbo_sd(teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-3)
+    #image_optimization(teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2)
+    turbo_sd(teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-3)
     #SD(teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0)
-    SD_lora(teachers_prompt, student_prompt, num_iters=1000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-1, eta=1e-2)
+    #SD_lora(teachers_prompt, student_prompt, num_iters=1000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-1, eta=1e-2)
 

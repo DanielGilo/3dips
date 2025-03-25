@@ -6,7 +6,7 @@ import numpy as np
 class DiffusionPipeline:
     def __init__(self, model_id, device, dtype):
         self.device = device
-        self.pipeline = StableDiffusionPipeline.from_pretrained(model_id, ).to(self.device)
+        self.pipeline = self.get_pipeline(model_id)
         self.scheduler = self.pipeline.scheduler
         self.unet = self.pipeline.unet
         self.prediction_type = self.pipeline.scheduler.prediction_type
@@ -16,16 +16,22 @@ class DiffusionPipeline:
         for p in self.unet.parameters():
             p.requires_grad = False
 
+    def get_pipeline(self, model_id):
+        return StableDiffusionPipeline.from_pretrained(model_id, ).to(self.device)
+
     def noise_to_timestep(self, z0, timestep, eps):
         alpha_t = self.alphas[timestep, None, None, None]
         sigma_t = self.sigmas[timestep, None, None, None]
         z_t = alpha_t * z0 + sigma_t * eps
         return z_t
 
+    def prepare_latent_input_for_unet(self, z_t):
+        return torch.cat([z_t] * 2)
+
     def predict_eps_and_sample(self, z_t, timestep, guidance_scale, text_embeddings):
         alpha_t = self.alphas[timestep, None, None, None]
         sigma_t = self.sigmas[timestep, None, None, None]
-        latent_input = torch.cat([z_t] * 2)
+        latent_input = self.prepare_latent_input_for_unet(z_t)
         timestep = torch.cat([timestep] * 2)
         embedd = text_embeddings.permute(1, 0, 2, 3).reshape(-1, *text_embeddings.shape[2:])
         with torch.autocast(device_type="cuda", dtype=torch.float16):
