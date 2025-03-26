@@ -40,7 +40,7 @@ def show_output_log(wandb, model):
 
     plt.tight_layout()
     wandb.log({"output_log": fig})
-    plt.show()
+    #plt.show()
 
 
 def get_timestep_linear_interp(i, num_iters, t_min, t_max):
@@ -86,6 +86,7 @@ def image_optimization(text_target, num_iters=200, guidance_scale=7.5, lr=1e-1):
         optimizer.zero_grad()
         loss.backward()  #used to be (2000 * loss).backward()
         optimizer.step()
+        wb.log({"loss": loss})
         if (i+ 1) % 50 == 0:
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
 
@@ -95,8 +96,12 @@ def image_optimization(text_target, num_iters=200, guidance_scale=7.5, lr=1e-1):
             output_log["pred_z0"].append(pred_z0.detach())
             output_log["t"].append(timestep.item())
 
+            wb.log({"z": wandb.Image(student.decode(z0_student.detach()), caption="z(t={})".format(timestep.item()))})
+            wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach()), caption="z_t(t={})".format(timestep.item()))})
+            wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
+
             out = teacher.decode(z0_student)
-            plt.imshow(out); plt.show()
+            #plt.imshow(out); plt.show()
     show_output_log(wb, teacher)
 
 
@@ -146,6 +151,7 @@ def turbo_sd(text_target, num_iters=200, guidance_scale=100, lr=1e-3):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        wb.log({"loss": loss})
         if (i+ 1) % 50 == 0:
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
         if ((i % show_interval) == 0) or (i == (num_iters-1)):
@@ -154,9 +160,13 @@ def turbo_sd(text_target, num_iters=200, guidance_scale=100, lr=1e-3):
             output_log["pred_z0"].append(pred_z0.detach())
             output_log["t"].append(timestep.item())
 
+            wb.log({"z": wandb.Image(student.decode(z0_student.detach()), caption="z(t={})".format(timestep.item()))})
+            wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach()), caption="z_t(t={})".format(timestep.item()))})
+            wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
+
             out = student.decode(z0_student)
-            plt.imshow(out);
-            plt.show()
+            #plt.imshow(out);
+            #plt.show()
     show_output_log(wb, student)
 
 
@@ -246,7 +256,13 @@ def SD(texts_target, text_source, num_iters=200, guidance_scale=7.5, student_gui
     show_interval = int(num_iters / 10)
 
     latent_shape = (1, 4, 64, 64)
-    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    #teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
+    mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
+    teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
+                                         model_id="runwayml/stable-diffusion-inpainting", device=device,
+                                         dtype=torch.float32)
+
     student = students.SDStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
 
     optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
@@ -271,7 +287,13 @@ def SD_lora(texts_target, text_source, num_iters=200, guidance_scale=7.5, studen
 
     show_interval = int(num_iters / 10)
     latent_shape = (1, 4, 64, 64)
-    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    #teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    
+    init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
+    mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
+    teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
+                                         model_id="runwayml/stable-diffusion-inpainting", device=device,
+                                         dtype=torch.float32)
     student = students.SDLoRAStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
 
     optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
@@ -292,7 +314,7 @@ if __name__ == '__main__':
     student_prompt = ""
     set_deterministic_state()
     #image_optimization(teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2)
-    turbo_sd(teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-3)
-    #SD(teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0)
-    #SD_lora(teachers_prompt, student_prompt, num_iters=1000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-1, eta=1e-2)
+    #turbo_sd(teachers_prompt[0], num_iters=10000, guidance_scale=7.5, lr=1e-2)
+    #SD(teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-2, eta=0.0)
+    SD_lora(teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e0, eta=0.0)
 
