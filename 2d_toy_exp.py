@@ -73,11 +73,19 @@ def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, 
 
     for i in range(num_iters):
         z0_student = student.predict_sample()
+
+
+        z0_student_orig = z0_student.clone().detach()
+        mask_i = torch.randint(0, len(masks), size=(1,)).item()
+        mask = masks[mask_i]
+        z0_student = z0_student * mask
+        z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
+
+
         eps = torch.randn(latent_shape, device=device)
         timestep = torch.randint(low=50, high=950,size=(latent_shape[0],), device=device, dtype=torch.long)
 
-        mask_i = torch.randint(0, len(masks), size=(1,)).item()
-        mask = masks[mask_i]
+
 
         w_t = 1
         loss, z_t, pred_z0 = losses.get_sds_loss(z0_student, teacher, text_embeddings, guidance_scale, eps, timestep, w_t, mask)
@@ -90,16 +98,16 @@ def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, 
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
 
         if i % show_interval == 0:
-            output_log["z"].append(z0_student.clone().detach())
+            output_log["z"].append(z0_student_orig.clone().detach())
             output_log["z_t"].append(z_t.detach())
             output_log["pred_z0"].append(pred_z0.detach())
             output_log["t"].append(timestep.item())
 
-            wb.log({"z": wandb.Image(teacher.decode(z0_student.detach()), caption="z(t={})".format(timestep.item()))})
+            wb.log({"z": wandb.Image(teacher.decode(z0_student_orig.detach()), caption="z(t={})".format(timestep.item()))})
             wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach()), caption="z_t(t={})".format(timestep.item()))})
             wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
 
-            out = teacher.decode(z0_student)
+            out = teacher.decode(z0_student_orig)
             plt.imshow(out); plt.show()
     show_output_log(wb, teacher)
 
@@ -129,6 +137,13 @@ def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, m
 
     for i in range(num_iters):
         eps_pred, z0_student = student.predict_eps_and_sample(z_T, T, 0.0, text_embeddings=student_embeddings)
+        z0_student_orig = z0_student.clone().detach()
+
+        mask_i = torch.randint(0, len(masks), size=(1,)).item()
+        mask = masks[mask_i]
+        z0_student = z0_student * mask
+        z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
+
 
         t_min_ = int((1 - (i/num_iters)) * t_max + (i/num_iters) * t_min)
         timestep = torch.randint(low=t_min_, high=t_max+1, size=(1,)).item()
@@ -152,16 +167,16 @@ def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, m
         if (i+ 1) % 50 == 0:
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
         if ((i % show_interval) == 0) or (i == (num_iters-1)):
-            output_log["z"].append(z0_student.detach())
+            output_log["z"].append(z0_student_orig.detach())
             output_log["z_t"].append(z_t.detach())
             output_log["pred_z0"].append(pred_z0.detach())
             output_log["t"].append(timestep.item())
 
-            wb.log({"z": wandb.Image(student.decode(z0_student.detach()), caption="z(t={})".format(timestep.item()))})
+            wb.log({"z": wandb.Image(student.decode(z0_student_orig.detach()), caption="z(t={})".format(timestep.item()))})
             wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach()), caption="z_t(t={})".format(timestep.item()))})
             wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
 
-            out = student.decode(z0_student)
+            out = student.decode(z0_student_orig)
             plt.imshow(out);
             plt.show()
     show_output_log(wb, student)
@@ -195,6 +210,13 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, s
 
         # image prediction - this is "g(theta)" in SDS terms
         eps_pred, z0_student = student.predict_eps_and_sample(z_t, timestep, student_guidance_scale, student_text_embeddings)
+        z0_student_orig = z0_student.clone().detach()
+
+        mask_i = torch.randint(0, len(masks), size=(1,)).item()
+        mask = masks[mask_i]
+        z0_student = z0_student * mask
+        z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
+
 
         # adding stochasticity to the predicted noise, according to Eq. 12, 16 in https://arxiv.org/pdf/2010.02502 (DDIM paper).
         # if eta > 0:
@@ -214,10 +236,6 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, s
 
         i_target = torch.randint(0, len(teacher_texts_embeddings), size=(1,)).item()
         w_t = 1
-
-        mask_i = torch.randint(0, len(masks), size=(1,)).item()
-        mask = masks[mask_i]
-
         loss, z_t, pred_z0 = losses.get_sds_loss(z0_student, teacher, teacher_texts_embeddings[i_target],
                                                            teacher_guidance_scale, eps, timestep, w_t, mask)
         gc.collect()
@@ -232,16 +250,16 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, s
         if (i + 1) % 50 == 0:
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
         if ((i % show_interval) == 0) or (i == (num_iters - 1)):
-            output_log["z"].append(z0_student.detach())
+            output_log["z"].append(z0_student_orig.detach())
             output_log["z_t"].append(z_t.detach())
             output_log["pred_z0"].append(pred_z0.detach())
             output_log["t"].append(timestep.item())
 
-            wb.log({"z": wandb.Image(student.decode(z0_student.detach()), caption="z(t={})".format(timestep.item()))})
+            wb.log({"z": wandb.Image(student.decode(z0_student_orig.detach()), caption="z(t={})".format(timestep.item()))})
             wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach()), caption="z_t(t={})".format(timestep.item()))})
             wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
 
-            out = student.decode(z0_student)
+            out = student.decode(z0_student_orig)
             plt.imshow(out);
             plt.show()
 
@@ -303,28 +321,28 @@ def get_masks(shape):
     mask1[..., :(shape[-1] // 2)] = 0.0
     mask2[..., (shape[-1] // 2):] = 0.0
 
-    return [mask2] # [mask1, mask2]
+    return [mask1, mask2]
 
 if __name__ == '__main__':
     latent_shape = (1, 4, 64, 64)
 
-    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
-    # init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
-    # mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
-    # teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
-    #                                      model_id="runwayml/stable-diffusion-inpainting", device=device,
-    #                                      dtype=torch.float32)
+    # teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
+    mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
+    teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
+                                         model_id="runwayml/stable-diffusion-inpainting", device=device,
+                                         dtype=torch.float32)
     #
 
-    teachers_prompt = ["a photorealistic image of a man riding a horse"]
-    #teachers_prompt = ["a photo of a cat sitting on a bench, facing the camera, high resolution"]
+    #teachers_prompt = ["a photorealistic image of a man riding a horse"]
+    teachers_prompt = ["a photo of a striped cat sitting on a bench, facing the camera, high resolution"]
     student_prompt = ""
     set_deterministic_state()
     masks = get_masks(latent_shape)
     #image_optimization(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2, masks=masks)
-    #turbo_sd(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-2, masks=masks)
-    SD(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
-                  lr=1e-3, eta=0.0, masks=masks)
+    turbo_sd(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-2, masks=masks)
+    #SD(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
+    #             lr=1e-3, eta=0.0, masks=masks)
     #SD_lora(teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
     #               lr=1e-1, eta=0.0, masks=masks)
 
