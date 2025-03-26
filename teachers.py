@@ -45,6 +45,9 @@ class InpaintingTeacher(Teacher):
 
     @override
     def prepare_latent_input_for_unet(self, z_t):
+        b_size = z_t.shape[0]
         z_t = torch.cat([z_t] * 2)
-        return torch.cat([z_t, self.mask_latents, self.masked_image_latents], dim=1)
+        mask_latents = torch.cat([self.mask_latents] * b_size)
+        masked_image_latents = torch.cat([self.masked_image_latents] * b_size)
+        return torch.cat([z_t, mask_latents, masked_image_latents], dim=1)
 

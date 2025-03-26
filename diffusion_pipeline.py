@@ -34,6 +34,8 @@ class DiffusionPipeline:
         latent_input = self.prepare_latent_input_for_unet(z_t)
         timestep = torch.cat([timestep] * 2)
         embedd = text_embeddings.permute(1, 0, 2, 3).reshape(-1, *text_embeddings.shape[2:])
+        embedd = torch.cat([embedd] * z_t.shape[0])
+        timestep = torch.cat([timestep] * z_t.shape[0])
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             e_t = self.unet(latent_input, timestep, embedd).sample
             if self.prediction_type == 'v_prediction':

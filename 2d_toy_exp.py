@@ -73,13 +73,18 @@ def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, 
 
     for i in range(num_iters):
         z0_student = student.predict_sample()
+        z0_student_orig = z0_student.clone()
 
-
-        z0_student_orig = z0_student.clone().detach()
-        mask_i = torch.randint(0, len(masks), size=(1,)).item()
-        mask = masks[mask_i]
-        z0_student = z0_student * mask
-        z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
+        # WIP!!
+        #mask_i = torch.randint(0, len(masks), size=(1,)).item()
+        #mask = masks[mask_i]
+        preds_student = []
+        for mask in masks:
+            z0_student = z0_student_orig * mask
+            z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
+            preds_student.append(z0_student)
+        preds_student = torch.cat(preds_student, dim=0)
+        mask = torch.cat(masks, dim=0)
 
 
         eps = torch.randn(latent_shape, device=device)
@@ -88,9 +93,9 @@ def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, 
 
 
         w_t = 1
-        loss, z_t, pred_z0 = losses.get_sds_loss(z0_student, teacher, text_embeddings, guidance_scale, eps, timestep, w_t, mask)
+        loss, z_t, pred_z0 = losses.get_sds_loss(preds_student, teacher, text_embeddings, guidance_scale, eps, timestep, w_t, mask)
         optimizer.zero_grad()
-        loss.backward()  #used to be (2000 * loss).backward()
+        loss.backward()
         optimizer.step()
         wb.log({"loss": loss})
         wb.log({"lr": optimizer.param_groups[0]['lr']})
@@ -139,10 +144,13 @@ def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, m
         eps_pred, z0_student = student.predict_eps_and_sample(z_T, T, 0.0, text_embeddings=student_embeddings)
         z0_student_orig = z0_student.clone().detach()
 
+        # mask and flip
         mask_i = torch.randint(0, len(masks), size=(1,)).item()
         mask = masks[mask_i]
         z0_student = z0_student * mask
         z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
+        eps_pred = eps_pred * mask
+        eps_pred = eps_pred + torch.flip(eps_pred, dims=(-1,))
 
 
         t_min_ = int((1 - (i/num_iters)) * t_max + (i/num_iters) * t_min)
@@ -216,6 +224,8 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, s
         mask = masks[mask_i]
         z0_student = z0_student * mask
         z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
+        eps_pred = eps_pred * mask
+        eps_pred = eps_pred + torch.flip(eps_pred, dims=(-1,))
 
 
         # adding stochasticity to the predicted noise, according to Eq. 12, 16 in https://arxiv.org/pdf/2010.02502 (DDIM paper).
@@ -313,7 +323,7 @@ def SD_lora(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.
     z_t = torch.randn(latent_shape, device=device, dtype=torch.float32, requires_grad=False)
     ddim_like_optimization_loop(optimizer, num_iters, student, text_source, student_guidance_scale,
                                 teacher, texts_target, guidance_scale, t_min, t_max, z_t, eta,
-                                show_interval, wb, masks=[None])
+                                show_interval, wb, masks=masks)
 
 def get_masks(shape):
     mask1 = torch.ones(shape, dtype=torch.float32, device=device)
@@ -339,10 +349,10 @@ if __name__ == '__main__':
     student_prompt = ""
     set_deterministic_state()
     masks = get_masks(latent_shape)
-    #image_optimization(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2, masks=masks)
-    turbo_sd(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-2, masks=masks)
+    image_optimization(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2, masks=masks)
+    #turbo_sd(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-3, masks=masks)
     #SD(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
     #             lr=1e-3, eta=0.0, masks=masks)
-    #SD_lora(teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
+    #SD_lora(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
     #               lr=1e-1, eta=0.0, masks=masks)
 
