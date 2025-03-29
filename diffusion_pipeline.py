@@ -54,7 +54,7 @@ class DiffusionPipeline:
 
     @torch.no_grad()
     def decode(self, latent):
-        image = self.pipeline.vae.decode((1 / 0.18215) * latent, return_dict=False)[0]
+        image = self.pipeline.vae.decode((1 / self.pipeline.vae.config.scaling_factor) * latent, return_dict=False)[0]
         image = denormalize(image)
         return Image.fromarray(image)
 
