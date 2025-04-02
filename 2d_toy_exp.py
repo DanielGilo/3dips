@@ -21,6 +21,7 @@ device = torch.device('cuda:0')
 
 output_log = {"z": [], "z_t": [], "pred_z0": [], "t": []}
 
+
 def show_output_log(wandb, model):
     nrows = len(output_log.keys()) - 1
     ncols = len(output_log["z"])
@@ -81,6 +82,8 @@ def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, 
         z0_student = student.predict_sample()
         z0_student_orig = z0_student.clone()
 
+        eps = torch.randn(latent_shape, device=device)
+
         if do_mask_and_flip:
             mask_i = torch.randint(0, len(masks), size=(1,)).item()
             mask = masks[mask_i]
@@ -96,7 +99,6 @@ def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, 
         # preds_student = torch.cat(preds_student, dim=0)
         # mask = torch.cat(masks, dim=0)
 
-        eps = torch.randn(latent_shape, device=device)
         timestep = torch.randint(low=50, high=950,size=(latent_shape[0],), device=device, dtype=torch.long)
 
         w_t = 1
@@ -162,8 +164,8 @@ def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, d
             mask = masks[mask_i]
             z0_student = z0_student * mask
             z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
-            eps_pred = eps_pred * mask
-            eps_pred = eps_pred + torch.flip(eps_pred, dims=(-1,))
+            # eps_pred = eps_pred * mask
+            # eps_pred = eps_pred + torch.flip(eps_pred, dims=(-1,))
 
 
         t_min_ = int((1 - (i/num_iters)) * t_max + (i/num_iters) * t_min)
@@ -241,8 +243,8 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, s
             mask = masks[mask_i]
             z0_student = z0_student * mask
             z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
-            eps_pred = eps_pred * mask
-            eps_pred = eps_pred + torch.flip(eps_pred, dims=(-1,))
+            # eps_pred = eps_pred * mask
+            # eps_pred = eps_pred + torch.flip(eps_pred, dims=(-1,))
 
 
         # adding stochasticity to the predicted noise, according to Eq. 12, 16 in https://arxiv.org/pdf/2010.02502 (DDIM paper).
@@ -344,14 +346,14 @@ def SD_lora(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.
                                 teacher, texts_target, guidance_scale, t_min, t_max, z_t, eta,
                                 show_interval, wb, do_mask_and_flip)
 
-
 def get_masks(shape):
     mask1 = torch.ones(shape, dtype=torch.float32, device=device)
     mask2 = torch.ones(shape, dtype=torch.float32, device=device)
     mask1[..., :(shape[-1] // 2)] = 0.0
     mask2[..., (shape[-1] // 2):] = 0.0
 
-    return [mask1, mask2]
+    #return [mask1, mask2]
+    return [mask1]
 
 
 if __name__ == '__main__':
