@@ -14,12 +14,26 @@ from controlnet_utils import get_canny_image, get_depth_estimation
 
 
 import os
+import argparse
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] =":4096:8" # necessary when setting torch.use_dererministic_algorithms(True)
 
 device = torch.device('cuda:0')
 
 output_log = {"z": [], "z_t": [], "pred_z0": [], "t": []}
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Parse user arguments for an experiment.")
+
+    parser.add_argument("--teacher_name", type=str, required=True, help="Name of the Teacher (string).")
+    parser.add_argument("--student_name", type=str, required=True, help="Name of the Student (string).")
+    parser.add_argument("--lr", type=float, required=True, help="Learning rate (float).")
+    parser.add_argument("--do_mask_and_flip", action='store_true', help="Boolean flag to enable mask and flip.")
+    parser.add_argument("--num_iterations", type=int, required=True, help="Number of iterations (integer).")
+
+    args = parser.parse_args()
+    return args
 
 
 def show_output_log(wandb, model):
@@ -41,7 +55,7 @@ def show_output_log(wandb, model):
 
     plt.tight_layout()
     wandb.log({"output_log": fig})
-    plt.show()
+    plt.show(block=False)
 
 
 def get_timestep_linear_interp(i, num_iters, t_min, t_max):
@@ -55,9 +69,9 @@ def set_deterministic_state():
     torch.use_deterministic_algorithms(True)
 
 
-def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, lr=1e-1, do_mask_and_flip=False, exp_name=""):
+def image_optimization(teacher, text_target, num_iters, guidance_scale, lr, do_mask_and_flip, teacher_name):
     config = {"text_target": text_target,  "num_iters": num_iters,
-              "teacher_guidance_scale": guidance_scale, "lr": lr, "exp_name": exp_name}
+              "teacher_guidance_scale": guidance_scale, "lr": lr, "teacher_name": teacher_name}
     wb = wandb.init(
         project="3dips",
         name="blank_canvas",
@@ -122,14 +136,14 @@ def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, 
             wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
 
             out = teacher.decode(z0_student_orig)
-            plt.imshow(out); plt.show()
+            plt.imshow(out); plt.show(block=False)
     show_output_log(wb, teacher)
 
 
-def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, do_mask_and_flip=False, exp_name=""):
+def turbo_sd(teacher, text_target, num_iters, guidance_scale, lr, do_mask_and_flip, exp_name):
     config = {"text_target": text_target, "num_iters": num_iters,
               "teacher_guidance_scale": guidance_scale, "lr": lr, "do_mask_and_flip?": do_mask_and_flip,
-              "exp_name": exp_name}
+              "teacher_name": teacher_name}
     wb = wandb.init(
         project="3dips",
         name="Turbo_SD",
@@ -199,18 +213,18 @@ def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, d
 
             out = student.decode(z0_student_orig)
             plt.imshow(out);
-            plt.show()
+            plt.show(block=False)
     show_output_log(wb, student)
 
 
-def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, student_guidance_scale,
+def ddim_like_optimization_loop(optimizer, num_iters, student, student_guidance_scale,
                                 teacher, teachers_prompts, teacher_guidance_scale, t_min, t_max, z_t, eta,
-                                show_interval, wb, do_mask_and_flip=False):
+                                show_interval, wb, do_mask_and_flip):
     with torch.no_grad():
         embedding_null = teacher.get_text_embeddings("")
         embeddings_text_teacher = [teacher.get_text_embeddings(text) for text in teachers_prompts]
         teacher_texts_embeddings = [torch.stack([embedding_null, e], dim=1) for e in embeddings_text_teacher]
-        student_text_embeddings = torch.stack([student.get_text_embeddings(""), student.get_text_embeddings(student_prompt)],
+        student_text_embeddings = torch.stack([student.get_text_embeddings(""), student.get_text_embeddings("")],
                                      dim=1)
 
     T = torch.stack([torch.tensor(t_max)] * z_t.shape[0], dim=0).to(device)
@@ -290,16 +304,16 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, s
 
             out = student.decode(z0_student_orig)
             plt.imshow(out);
-            plt.show()
+            plt.show(block=False)
 
     show_output_log(wb, student)
 
 
-def SD(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0,
-       do_mask_and_flip=False, exp_name=""):
-    config = {"texts_target": texts_target, "text_source": text_source, "num_iters": num_iters,
+def SD(teacher, texts_target, num_iters, guidance_scale, student_guidance_scale, lr, eta,
+       do_mask_and_flip, teacher_name):
+    config = {"texts_target": texts_target, "num_iters": num_iters,
               "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta, "do_mask_and_flip?": do_mask_and_flip,
-              "exp_name": exp_name}
+              "teacher_name": teacher_name}
     wb = wandb.init(
         project="3dips",
         name="SD",
@@ -316,16 +330,16 @@ def SD(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.5, st
     t_max = 999
 
     z_t = torch.randn(latent_shape, device=device, dtype=torch.float32, requires_grad=False)
-    ddim_like_optimization_loop(optimizer, num_iters, student, text_source, student_guidance_scale,
+    ddim_like_optimization_loop(optimizer, num_iters, student, student_guidance_scale,
                                 teacher, texts_target, guidance_scale, t_min, t_max, z_t, eta,
                                 show_interval, wb, do_mask_and_flip)
 
 
-def SD_lora(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3,
-            eta=0.0, do_mask_and_flip=False, exp_name=""):
-    config = {"texts_target": texts_target, "text_source": text_source, "num_iters": num_iters,
+def SD_lora(teacher, texts_target, num_iters, guidance_scale, student_guidance_scale, lr,
+            eta, do_mask_and_flip, teacher_name):
+    config = {"texts_target": texts_target, "num_iters": num_iters,
                  "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta, "do_mask_and_flip?": do_mask_and_flip,
-                 "exp_name": exp_name}
+                 "teacher_name": teacher_name}
     wb = wandb.init(
         # Set the wandb project where this run will be logged.
         project="3dips",
@@ -342,7 +356,7 @@ def SD_lora(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.
     t_max = 999
 
     z_t = torch.randn(latent_shape, device=device, dtype=torch.float32, requires_grad=False)
-    ddim_like_optimization_loop(optimizer, num_iters, student, text_source, student_guidance_scale,
+    ddim_like_optimization_loop(optimizer, num_iters, student, student_guidance_scale,
                                 teacher, texts_target, guidance_scale, t_min, t_max, z_t, eta,
                                 show_interval, wb, do_mask_and_flip)
 
@@ -356,52 +370,82 @@ def get_masks(shape):
     return [mask1]
 
 
-if __name__ == '__main__':
-    set_deterministic_state()
+def get_text_conditioned_teacher():
+    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    teachers_prompt = ["a photorealistic image of a man riding a horse"]
+    return teacher, teachers_prompt
 
-    # SD teacher
 
-    #exp_name = "text-conditioned"
-    #teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
-    #teachers_prompt = ["a photorealistic image of a man riding a horse"]
+def get_inpainting_teacher():
+    init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
+    mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
+    teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
+                                          model_id="runwayml/stable-diffusion-inpainting", device=device,
+                                          dtype=torch.float32)
+    teachers_prompt = ["a photo of a striped cat sitting on a bench, facing the camera, high resolution"]
+    return teacher, teachers_prompt
 
-    # Inpainting teacher
 
-    # exp_name = "inpainting"
-    # init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
-    # mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
-    # teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
-    #                                       model_id="runwayml/stable-diffusion-inpainting", device=device,
-    #                                       dtype=torch.float32)
-    # teachers_prompt = ["a photo of a striped cat sitting on a bench, facing the camera, high resolution"]
+def get_canny_teacher():
+    init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
+    canny_image = get_canny_image(init_image)
+    teacher = teachers.ControlNetTeacher(cond_image=canny_image, controlnet_id="lllyasviel/sd-controlnet-canny",
+                                        model_id="runwayml/stable-diffusion-v1-5", device=device, dtype=torch.float32)
+    teachers_prompt = ["a dog facing the camera, center of the frame"]
+    return teacher, teachers_prompt
 
-    # Controlnet canny teacher
 
-    # exp_name = "canny"
-    # init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
-    # canny_image = get_canny_image(init_image)
-    # teacher = teachers.ControlNetTeacher(cond_image=canny_image, controlnet_id="lllyasviel/sd-controlnet-canny",
-    #                                     model_id="runwayml/stable-diffusion-v1-5", device=device, dtype=torch.float32)
-    # teachers_prompt = ["a dog facing the camera, center of the frame"]
-
-    # Controlnet depth teacher
-
-    exp_name = "depth"
+def get_depth_teacher():
     init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
     depth_image = get_depth_estimation(init_image)
     teacher = teachers.ControlNetTeacher(cond_image=depth_image, controlnet_id="lllyasviel/sd-controlnet-depth",
                                          model_id="runwayml/stable-diffusion-v1-5", device=device, dtype=torch.float32)
     teachers_prompt = ["a dog facing the camera, center of the frame"]
-
-    student_prompt = ""
-    do_mask_and_flip = True #True
+    return teacher, teachers_prompt
 
 
-    #image_optimization(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2,
-    #                   do_mask_and_flip=do_mask_and_flip, exp_name=exp_name)
-    #turbo_sd(teacher, teachers_prompt[0], num_iters=10000, guidance_scale=7.5, lr=1e-3, do_mask_and_flip=do_mask_and_flip, exp_name=exp_name)
-    SD(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
-                 lr=1e-3, eta=0.0, do_mask_and_flip=do_mask_and_flip, exp_name=exp_name)
-    #SD_lora(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
-    #               lr=5e-2, eta=0.0, do_mask_and_flip=do_mask_and_flip, exp_name=exp_name)
+def get_teacher(teacher_name):
+    if teacher_name == "text-conditioned":
+        return get_text_conditioned_teacher()
+    if teacher_name == "inpainting":
+        return get_inpainting_teacher()
+    if teacher_name == "canny":
+        return get_canny_teacher()
+    if teacher_name == "depth":
+        return get_depth_teacher()
+    raise ValueError("Wrong teacher_name: {}".format(teacher_name))
+
+
+def train_student(student_name, teacher, teachers_prompt, lr, num_iterations, do_mask_and_flip, teacher_name):
+    if student_name == "blank_canvas":
+        return image_optimization(teacher, teachers_prompt[0], num_iters=num_iterations, guidance_scale=7.5, lr=lr,
+                do_mask_and_flip=do_mask_and_flip, teacher_name=teacher_name)
+    if student_name == "turbo-sd":
+        return turbo_sd(teacher, teachers_prompt[0], num_iters=num_iterations, guidance_scale=7.5, lr=lr,
+                 do_mask_and_flip=do_mask_and_flip, teacher_name=teacher_name)
+    if student_name == "sd":
+        return SD(teacher, teachers_prompt, num_iters=num_iterations, guidance_scale=7.5, student_guidance_scale=7.5,
+                lr=lr, eta=0.0, do_mask_and_flip=do_mask_and_flip, teacher_name=teacher_name)
+    if student_name == "sd-lora":
+        return SD_lora(teacher, teachers_prompt, num_iters=num_iterations, guidance_scale=7.5, student_guidance_scale=7.5,
+                lr=lr, eta=0.0, do_mask_and_flip=do_mask_and_flip, teacher_name=teacher_name)
+    raise ValueError("Wrong student_name: {}".format(student_name))
+
+
+if __name__ == '__main__':
+    set_deterministic_state()
+
+    args = parse_arguments()
+    teacher_name = args.teacher_name
+    lr = args.lr
+    num_iterations = args.num_iterations
+    do_mask_and_flip = args.do_mask_and_flip
+    student_name = args.student_name
+    teacher, teachers_prompt = get_teacher(teacher_name)
+
+    train_student(student_name, teacher, teachers_prompt, lr, num_iterations, do_mask_and_flip, teacher_name)
+
+
+
+
 
