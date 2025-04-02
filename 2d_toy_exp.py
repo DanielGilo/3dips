@@ -54,9 +54,9 @@ def set_deterministic_state():
     torch.use_deterministic_algorithms(True)
 
 
-def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, lr=1e-1, do_mask_and_flip=False):
+def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, lr=1e-1, do_mask_and_flip=False, exp_name=""):
     config = {"text_target": text_target,  "num_iters": num_iters,
-              "teacher_guidance_scale": guidance_scale, "lr": lr}
+              "teacher_guidance_scale": guidance_scale, "lr": lr, "exp_name": exp_name}
     wb = wandb.init(
         project="3dips",
         name="blank_canvas",
@@ -124,9 +124,10 @@ def image_optimization(teacher, text_target, num_iters=200, guidance_scale=7.5, 
     show_output_log(wb, teacher)
 
 
-def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, do_mask_and_flip=False):
+def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, do_mask_and_flip=False, exp_name=""):
     config = {"text_target": text_target, "num_iters": num_iters,
-              "teacher_guidance_scale": guidance_scale, "lr": lr}
+              "teacher_guidance_scale": guidance_scale, "lr": lr, "do_mask_and_flip?": do_mask_and_flip,
+              "exp_name": exp_name}
     wb = wandb.init(
         project="3dips",
         name="Turbo_SD",
@@ -142,7 +143,7 @@ def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, d
 
     optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
 
-    t_min = 50
+    t_min = 200
     t_max = 999
     z_T = torch.randn(latent_shape, device=device, dtype=torch.float32)
     T = torch.stack([torch.tensor(t_max)] * latent_shape[0], dim=0).to(device)
@@ -167,6 +168,7 @@ def turbo_sd(teacher, text_target, num_iters=200, guidance_scale=100, lr=1e-3, d
 
         t_min_ = int((1 - (i/num_iters)) * t_max + (i/num_iters) * t_min)
         timestep = torch.randint(low=t_min_, high=t_max+1, size=(1,)).item()
+        #timestep = get_timestep_linear_interp(i, num_iters, t_min, t_max)
         timestep = torch.stack([torch.tensor(timestep)] * z0_student.shape[0], dim=0).to(device)
         w_t = 1
 
@@ -292,9 +294,10 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_prompt, s
 
 
 def SD(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3, eta=0.0,
-       do_mask_and_flip=False):
+       do_mask_and_flip=False, exp_name=""):
     config = {"texts_target": texts_target, "text_source": text_source, "num_iters": num_iters,
-              "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta}
+              "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta, "do_mask_and_flip?": do_mask_and_flip,
+              "exp_name": exp_name}
     wb = wandb.init(
         project="3dips",
         name="SD",
@@ -317,9 +320,10 @@ def SD(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.5, st
 
 
 def SD_lora(teacher, texts_target, text_source, num_iters=200, guidance_scale=7.5, student_guidance_scale=7.5, lr=1e-3,
-            eta=0.0, do_mask_and_flip=False):
+            eta=0.0, do_mask_and_flip=False, exp_name=""):
     config = {"texts_target": texts_target, "text_source": text_source, "num_iters": num_iters,
-                 "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta}
+                 "teacher_guidance_scale": guidance_scale, "lr": lr, "eta": eta, "do_mask_and_flip?": do_mask_and_flip,
+                 "exp_name": exp_name}
     wb = wandb.init(
         # Set the wandb project where this run will be logged.
         project="3dips",
@@ -351,47 +355,51 @@ def get_masks(shape):
 
 
 if __name__ == '__main__':
+    set_deterministic_state()
 
     # SD teacher
 
+    #exp_name = "text-conditioned"
     #teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
     #teachers_prompt = ["a photorealistic image of a man riding a horse"]
 
     # Inpainting teacher
 
+    # exp_name = "inpainting"
     # init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
     # mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
     # teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
-    #                                      model_id="runwayml/stable-diffusion-inpainting", device=device,
-    #                                      dtype=torch.float32)
-    #teachers_prompt = ["a photo of a striped cat sitting on a bench, facing the camera, high resolution"]
+    #                                       model_id="runwayml/stable-diffusion-inpainting", device=device,
+    #                                       dtype=torch.float32)
+    # teachers_prompt = ["a photo of a striped cat sitting on a bench, facing the camera, high resolution"]
 
     # Controlnet canny teacher
 
+    # exp_name = "canny"
     # init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
     # canny_image = get_canny_image(init_image)
     # teacher = teachers.ControlNetTeacher(cond_image=canny_image, controlnet_id="lllyasviel/sd-controlnet-canny",
-    #                                      model_id="runwayml/stable-diffusion-v1-5", device=device, dtype=torch.float32)
+    #                                     model_id="runwayml/stable-diffusion-v1-5", device=device, dtype=torch.float32)
     # teachers_prompt = ["a dog facing the camera, center of the frame"]
 
     # Controlnet depth teacher
 
-    init_image = PIL.Image.open("bee.png").convert("RGB").resize((512, 512))
+    exp_name = "depth"
+    init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
     depth_image = get_depth_estimation(init_image)
     teacher = teachers.ControlNetTeacher(cond_image=depth_image, controlnet_id="lllyasviel/sd-controlnet-depth",
                                          model_id="runwayml/stable-diffusion-v1-5", device=device, dtype=torch.float32)
-    teachers_prompt = ["a bee on a flower"]
+    teachers_prompt = ["a dog facing the camera, center of the frame"]
 
     student_prompt = ""
-    set_deterministic_state()
-    do_mask_and_flip = True
+    do_mask_and_flip = True #True
 
 
-    image_optimization(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2,
-                       do_mask_and_flip=do_mask_and_flip)
-    #turbo_sd(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e-3, do_mask_and_flip=do_mask_and_flip)
-    #SD(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
-    #             lr=1e-3, eta=0.0, do_mask_and_flip=do_mask_and_flip)
+    #image_optimization(teacher, teachers_prompt[0], num_iters=3000, guidance_scale=7.5, lr=1e2,
+    #                   do_mask_and_flip=do_mask_and_flip, exp_name=exp_name)
+    #turbo_sd(teacher, teachers_prompt[0], num_iters=10000, guidance_scale=7.5, lr=1e-3, do_mask_and_flip=do_mask_and_flip, exp_name=exp_name)
+    SD(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
+                 lr=1e-3, eta=0.0, do_mask_and_flip=do_mask_and_flip, exp_name=exp_name)
     #SD_lora(teacher, teachers_prompt, student_prompt, num_iters=10000, guidance_scale=7.5, student_guidance_scale=7.5,
-    #               lr=1e-1, eta=0.0, do_mask_and_flip=do_mask_and_flip)
+    #               lr=5e-2, eta=0.0, do_mask_and_flip=do_mask_and_flip, exp_name=exp_name)
 
