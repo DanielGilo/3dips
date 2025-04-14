@@ -52,3 +52,36 @@ class SDLoRAStudent(DiffusionStudent):
     def get_trainable_parameters(self):
         return self.lora_layers
 
+
+# class SevaStudent:
+#     class DiffusionPipeline:
+#         def __init__(self, model_id, device, dtype):
+#             self.device = device
+#             self.scheduler = self.pipeline.scheduler
+#             self.unet = self.pipeline.unet
+#             self.prediction_type = self.pipeline.scheduler.prediction_type
+#             with torch.inference_mode():
+#                 self.alphas = torch.sqrt(self.scheduler.alphas_cumprod).to(self.device, dtype=dtype)
+#                 self.sigmas = torch.sqrt(1 - self.scheduler.alphas_cumprod).to(self.device, dtype=dtype)
+#             for p in self.unet.parameters():
+#                 p.requires_grad = False
+
+#         def noise_to_timestep(self, z0, timestep, eps):
+#             alpha_t = self.alphas[timestep, None, None, None]
+#             sigma_t = self.sigmas[timestep, None, None, None]
+#             z_t = alpha_t * z0 + sigma_t * eps
+#             return z_t
+
+#         def prepare_latent_input_for_unet(self, z_t):
+#             return torch.cat([z_t] * 2)
+
+#         def predict_eps_and_sample(self, z_t, timestep, guidance_scale, text_embeddings):
+
+
+#         @torch.no_grad()
+#         def get_text_embeddings(self, text: str):
+
+
+#         @torch.no_grad()
+#         def decode(self, latent):
+            
