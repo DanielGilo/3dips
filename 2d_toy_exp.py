@@ -85,7 +85,7 @@ def image_optimization(teacher, text_target, num_iters, guidance_scale, lr, do_m
     student = students.BlankCanvasStudent(latent_shape=latent_shape, device=device)
 
     text_embeddings = torch.stack([teacher.get_text_embeddings(""), teacher.get_text_embeddings(text_target)], dim=1)
-    optimizer = SGD(params=student.get_trainable_params(), lr=lr)
+    optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
 
     if do_mask_and_flip:
         masks = get_masks(latent_shape)

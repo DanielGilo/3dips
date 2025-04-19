@@ -15,6 +15,6 @@ def get_sds_loss(z0_student, teacher, text_embeddings, teacher_guidance_scale, e
         grad_z *= index_mask
     sds_loss = grad_z.clone() * z0_student
     del grad_z
-    sds_loss = sds_loss.sum() / (z0_student.shape[2] * z0_student.shape[3]) # Daniel: normalization is necessary to avoid exploding grads
+    sds_loss = sds_loss.sum() / (z0_student.shape[0] * z0_student.shape[2] * z0_student.shape[3]) # Daniel: normalization is necessary to avoid exploding grads
 
     return sds_loss, z_t, pred_z0

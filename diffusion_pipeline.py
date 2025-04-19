@@ -39,7 +39,7 @@ class DiffusionPipeline:
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             e_t = self.unet(latent_input, timestep, embedd).sample
             if self.prediction_type == 'v_prediction':
-                e_t = torch.cat([alpha_t] * 2) * e_t + torch.cat([sigma_t] * 2) * latent_input
+                e_t = torch.cat([alpha_t] * timestep.shape[0]) * e_t + torch.cat([sigma_t] * timestep.shape[0]) * latent_input
             e_t_uncond, e_t = e_t.chunk(2)
             e_t = e_t_uncond + guidance_scale * (e_t - e_t_uncond)
             assert torch.isfinite(e_t).all()
