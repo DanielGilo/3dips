@@ -1,5 +1,6 @@
 import torch
 from torch.optim.sgd import SGD
+from torchvision.transforms.functional import to_pil_image, pil_to_tensor
 import numpy as np
 import PIL
 
@@ -370,50 +371,7 @@ def get_masks(shape):
     return [mask1]
 
 
-def get_text_conditioned_teacher():
-    teacher = teachers.Teacher(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
-    teachers_prompt = ["a photorealistic image of a man riding a horse"]
-    return teacher, teachers_prompt
 
-
-def get_inpainting_teacher():
-    init_image = PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))
-    mask_image = PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))
-    teacher = teachers.InpaintingTeacher(init_image=init_image, mask_image=mask_image,
-                                          model_id="runwayml/stable-diffusion-inpainting", device=device,
-                                          dtype=torch.float32)
-    teachers_prompt = ["a photo of a striped cat sitting on a bench, facing the camera, high resolution"]
-    return teacher, teachers_prompt
-
-
-def get_canny_teacher():
-    init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
-    canny_image = get_canny_image(init_image)
-    teacher = teachers.ControlNetTeacher(cond_image=canny_image, controlnet_id="lllyasviel/sd-controlnet-canny",
-                                        model_id="runwayml/stable-diffusion-v1-5", device=device, dtype=torch.float32)
-    teachers_prompt = ["a dog facing the camera, center of the frame"]
-    return teacher, teachers_prompt
-
-
-def get_depth_teacher():
-    init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
-    depth_image = get_depth_estimation(init_image)
-    teacher = teachers.ControlNetTeacher(cond_image=depth_image, controlnet_id="lllyasviel/sd-controlnet-depth",
-                                         model_id="runwayml/stable-diffusion-v1-5", device=device, dtype=torch.float32)
-    teachers_prompt = ["a dog facing the camera, center of the frame"]
-    return teacher, teachers_prompt
-
-
-def get_teacher(teacher_name):
-    if teacher_name == "text-conditioned":
-        return get_text_conditioned_teacher()
-    if teacher_name == "inpainting":
-        return get_inpainting_teacher()
-    if teacher_name == "canny":
-        return get_canny_teacher()
-    if teacher_name == "depth":
-        return get_depth_teacher()
-    raise ValueError("Wrong teacher_name: {}".format(teacher_name))
 
 
 def train_student(student_name, teacher, teachers_prompt, lr, num_iterations, do_mask_and_flip, teacher_name):

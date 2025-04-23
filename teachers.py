@@ -3,6 +3,10 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers import StableDiffusionInpaintPipeline, StableDiffusionControlNetPipeline, ControlNetModel
 from overrides import override
 import torch
+import PIL
+from torchvision.transforms.functional import to_pil_image, pil_to_tensor
+from plot_utils import plot_frames_row
+
 
 
 class Teacher(DiffusionPipeline):
@@ -24,7 +28,8 @@ class InpaintingTeacher(Teacher):
 
     @torch.no_grad()
     def prepare_image_and_mask_latents(self, init_image, mask_image):
-        height, width = init_image.height, init_image.width
+        height, width = init_image[0].height, init_image[0].width
+        #height, width = init_image.shape[-2:]
         init_image = self.pipeline.image_processor.preprocess(init_image, height=height, width=width, crops_coords=None,
                                                           resize_mode="default").to(dtype=torch.float32)
         mask_condition = self.mask_processor.preprocess(mask_image, height=height, width=width, crops_coords=None,
@@ -43,15 +48,53 @@ class InpaintingTeacher(Teacher):
         mask_latents = torch.cat([mask] * 2).to(device=self.device)
         masked_image_latents = torch.cat([masked_image_latent] * 2).to(device=self.device)
 
+        del masked_image
+        del mask
+        torch.cuda.empty_cache()
+
         return mask_latents, masked_image_latents
 
     @override
     def prepare_latent_input_for_unet(self, z_t):
         b_size = z_t.shape[0]
         z_t = torch.cat([z_t] * 2)
-        mask_latents = torch.cat([self.mask_latents] * b_size)
-        masked_image_latents = torch.cat([self.masked_image_latents] * b_size)
-        return torch.cat([z_t, mask_latents, masked_image_latents], dim=1)
+        #mask_latents = torch.cat([self.mask_latents] * b_size)
+        #masked_image_latents = torch.cat([self.masked_image_latents] * b_size)
+        #return torch.cat([z_t, mask_latents, masked_image_latents], dim=1)
+        return torch.cat([z_t, self.mask_latents, self.masked_image_latents], dim=1)
+    
+
+
+class OracleTeacher(Teacher):
+    def __init__(self, gt_images, **kwargs):
+        super().__init__(**kwargs)
+        
+        self.unet.to("cpu")
+        torch.cuda.empty_cache()
+
+        self.gt_images = gt_images # for plot input
+
+        gt = self.pipeline.image_processor.preprocess(gt_images, height=gt_images[0].height, width=gt_images[0].width, crops_coords=None,
+                                                          resize_mode="default").to(dtype=torch.float32).to(self.device)
+        with torch.no_grad():
+            self.gt_latents = self.pipeline.vae.encode(gt).latent_dist.mean * self.pipeline.vae.config.scaling_factor
+
+    @override
+    def predict_eps_and_sample(self, z_t, timestep, guidance_scale, text_embeddings):
+        alpha_t = self.alphas[timestep, None, None, None]
+        sigma_t = self.sigmas[timestep, None, None, None]
+
+        # oracle "prediction"
+        pred_z0 = self.gt_latents
+
+        e_t = (z_t - alpha_t * pred_z0) / sigma_t
+        return e_t, pred_z0
+    
+    def plot_input(self, wb):
+        plot_frames_row(self.gt_images, wb, "GT", "GT")
+
+    
+
 
 
 
@@ -117,3 +160,50 @@ class ControlNetTeacher(Teacher):
             assert torch.isfinite(e_t).all()
         pred_z0 = (z_t - sigma_t * e_t) / alpha_t
         return e_t, pred_z0
+
+
+
+
+def get_inpainting_teacher(**kwargs):
+    # init_image = [PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))]
+    # mask_image = [PIL.Image.open("example_mask.png").convert("RGB").resize((512, 512))]
+    teacher = InpaintingTeacher(init_image=kwargs["init_images"], mask_image=kwargs["mask_images"],
+                                          model_id="stabilityai/stable-diffusion-2-inpainting", device=kwargs["device"],
+                                          dtype=torch.float32)
+    return teacher
+
+
+def get_canny_teacher(**kwargs):
+    init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
+    canny_image = get_canny_image(init_image)
+    teacher = ControlNetTeacher(cond_image=canny_image, controlnet_id="lllyasviel/sd-controlnet-canny",
+                                        model_id="runwayml/stable-diffusion-v1-5", device=kwargs["device"], dtype=torch.float32)
+    return teacher
+
+
+def get_depth_teacher(**kwargs):
+    init_image = PIL.Image.open("dog.png").convert("RGB").resize((512, 512))
+    depth_image = get_depth_estimation(init_image)
+    teacher = ControlNetTeacher(cond_image=depth_image, controlnet_id="lllyasviel/sd-controlnet-depth",
+                                         model_id="runwayml/stable-diffusion-v1-5", device=kwargs["device"], dtype=torch.float32)
+    return teacher
+
+
+def extract_gt_images_from_value_dict(value_dict):
+    torch_gt = (((value_dict["cond_frames"] + 1) / 2.0)* 255).clamp(0, 255).to(torch.uint8)
+    pil_gt = [to_pil_image(torch_gt[i]) for i in range(torch_gt.shape[0])]
+    return pil_gt
+
+def get_teacher(teacher_name, value_dict, **kwargs):
+    if teacher_name == "text-conditioned":
+        return Teacher(model_id="stabilityai/stable-diffusion-2-1", device=kwargs["device"], dtype=torch.float32)
+    if teacher_name == "inpainting":
+        return get_inpainting_teacher(**kwargs)
+    if teacher_name == "canny":
+        return get_canny_teacher(**kwargs)
+    if teacher_name == "depth":
+        return get_depth_teacher(**kwargs)
+    if teacher_name == "oracle":
+        return OracleTeacher(gt_images=extract_gt_images_from_value_dict(value_dict), 
+                             model_id="stabilityai/stable-diffusion-2-1", device=kwargs["device"], dtype=torch.float32)
+    raise ValueError("Wrong teacher_name: {}".format(teacher_name))

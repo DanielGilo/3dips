@@ -1,6 +1,7 @@
 from diffusion_pipeline import DiffusionPipeline
 from overrides import override
 import torch
+import itertools
 
 # seva imports
 from seva.seva.utils import load_model
@@ -67,9 +68,7 @@ class SDLoRAStudent(DiffusionStudent):
 
 
 
-
-
-class SevaLoRAStudent:
+class SevaStudent:
     def __init__(self, device, value_dict):
         self.device = device
         self.model = SGMWrapper(load_model(device="cpu", verbose=True)).to(self.device)
@@ -88,20 +87,19 @@ class SevaLoRAStudent:
             "options": {},
         }
 
-        self.model.train()
-
-        # Turning off trainable parameters, except for the first layer (due to LoRA bug)
-        self.model.requires_grad_(False)
-        first_layer = self.model.module.input_blocks[0]
-        for name, param in first_layer.named_parameters():
-            param.requires_grad = True
-        
-        self.model_lora_params, _ = inject_trainable_lora(self.model)
-
-
         self.value_dict = value_dict
 
         self.c, self.uc, self.additional_model_inputs, self.additional_sampler_inputs = self.prepare_model_inputs()
+
+        self.model.train()
+        self.set_model_requires_grad()
+
+    def set_model_requires_grad(self):
+        self.model.requires_grad_(True)
+
+    def get_latent_shape(self):
+        return [self.version_dict["T"],self.version_dict["C"],
+                self.version_dict["H"] // self.version_dict["f"], self.version_dict["W"] // self.version_dict["f"]] # [21, 4, 72, 72] 
 
     def prepare_model_inputs(self):
         """
@@ -114,10 +112,8 @@ class SevaLoRAStudent:
 
         T = self.version_dict["T"]
 
-        num_samples = [1, T]
         encoding_t = 1 # not sure what that is
         with torch.inference_mode():
-        #with torch.autocast("cuda"): # Elias
             self.ae = self.ae.to(self.device)
             self.conditioner = self.conditioner.to(self.device)
 
@@ -171,9 +167,8 @@ class SevaLoRAStudent:
 
             return c, uc, additional_model_inputs, additional_sampler_inputs
 
-
     def get_trainable_parameters(self):
-        return self.model_lora_params
+        return self.model.parameters()
 
     def noise_to_timestep(self, z0, timestep, eps):
         raise NotImplementedError # I think this function is not needed for a student
@@ -192,7 +187,7 @@ class SevaLoRAStudent:
         pred_z0_c_and_uc = self.denoiser(self.model, input, sigma, c.copy(), **self.additional_model_inputs)
 
         # logic taken from seva's DiscreteDenoiser __call__() method, 
-        # here we isolate the network output which is the predicted noise from the denoiser's return value.
+        # here we isolate the network output (which is the predicted noise) from the denoiser's return value.
         sigma = append_dims(sigma, input.ndim)
         if "replace" in c: # for input frames (mask = True) use the clean latents
             x, mask = c.pop("replace").split((input.shape[1], 1), dim=1)
@@ -215,4 +210,34 @@ class SevaLoRAStudent:
         unload_model(self.ae)
 
         return samples
+
+
+
+class SevaLoRAStudent(SevaStudent):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @override
+    def set_model_requires_grad(self):
+         # Turning off trainable parameters, except for the first layer (due to LoRA bug)
+        self.model.requires_grad_(False)
+        first_layer = self.model.module.input_blocks[0]
+        for _, param in first_layer.named_parameters():
+            param.requires_grad = True
         
+        self.model_lora_params, _ = inject_trainable_lora(self.model)
+
+    @override
+    def get_trainable_parameters(self):
+        return itertools.chain(*self.model_lora_params) 
+
+   
+
+def get_mv_student(student_name, **kwargs):
+    if student_name == "seva":
+        return SevaStudent(**kwargs)
+    elif student_name == "seva_lora":
+        return SevaLoRAStudent(**kwargs)   
+    else:
+        raise ValueError(f"Unknown multiview student name: {student_name}")
+
