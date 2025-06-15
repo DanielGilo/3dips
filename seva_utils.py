@@ -107,11 +107,18 @@ def parse_task(
     c2ws = c2ws[sampled_indices]
     Ks = Ks[sampled_indices]
 
-    # absolute to relative indices
-    input_indices = compute_relative_inds(
-        sampled_indices,
-        np.array(split_dict["train_ids"]),
-    )
+    # Daniel  - handle case of single view to single view
+    if (len(split_dict["train_ids"]) == 1) and (len(sampled_indices) == 2):
+        if np.array(split_dict["train_ids"])[0] == sampled_indices.min():
+            input_indices = [0]
+        else:
+            input_indices = [1]
+    else: # Original code
+        # absolute to relative indices
+        input_indices = compute_relative_inds(
+            sampled_indices,
+            np.array(split_dict["train_ids"]),
+        )
     anchor_indices = np.arange(
         sampled_indices.shape[0],
         sampled_indices.shape[0] + num_anchors,
@@ -131,7 +138,7 @@ def parse_task(
     )
 
 @torch.no_grad()
-def get_value_dict_of_scene(scene):
+def get_value_dict_of_scene(scene, num_inputs):
 
     version_dict = {
         "H": 576,
@@ -144,7 +151,6 @@ def get_value_dict_of_scene(scene):
     seed = 42
 
 
-    num_inputs = 1
     task = "img2img"
 
 
@@ -251,7 +257,7 @@ def get_value_dict_of_scene(scene):
     options["num_frames"] = T
     torch.cuda.empty_cache()
 
-    seed_everything(seed)
+    #seed_everything(seed) # moved to main script
 
     # Get Data
     input_indices = image_cond["input_indices"]
@@ -266,6 +272,8 @@ def get_value_dict_of_scene(scene):
     test_c2ws = camera_cond["c2w"][test_indices]
     test_Ks = camera_cond["K"][test_indices]
 
+    
+    num_imgs_no_padding = len(input_imgs) + len(test_imgs) # Daniel
 
     chunk_strategy = options.get("chunk_strategy", "gt")
     (
@@ -363,5 +371,7 @@ def get_value_dict_of_scene(scene):
         all_c2ws=camera_cond["c2w"],
         camera_scale=options.get("camera_scale", 2.0),
     )
+
+    value_dict["num_imgs_no_padding"] = num_imgs_no_padding # Daniel
 
     return value_dict

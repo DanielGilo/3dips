@@ -1,4 +1,4 @@
-from diffusion_pipeline import DiffusionPipeline
+from diffusion_pipeline import DiffusionPipeline, SevaPipeline
 from overrides import override
 import torch
 import itertools
@@ -10,22 +10,31 @@ from seva.seva.modules.autoencoder import AutoEncoder
 from seva.seva.modules.conditioner import CLIPConditioner
 from seva.seva.sampling import DDPMDiscretization, DiscreteDenoiser, MultiviewCFG, append_dims
 from seva.seva.eval import unload_model
-from lora_diffusion import inject_trainable_lora
+from lora_diffusion import inject_trainable_lora, inject_trainable_lora_extended
 from einops import repeat
 
+from plot_utils import seva_tensor_to_np_plottable
 
 
 
 
 class BlankCanvasStudent:
     def __init__(self, latent_shape, device):
-        self.theta = torch.randn(latent_shape, requires_grad=True, device=device).float()
+        self.theta = torch.randn(latent_shape, requires_grad=True, device=device, dtype=torch.float16)
+        self.latent_shape = latent_shape
+        self.discretization = DDPMDiscretization() # just for compatability with mv distillation script, has no meaning
 
     def get_trainable_parameters(self):
         return [self.theta]
 
     def predict_sample(self):
         return self.theta
+    
+    def get_latent_shape(self):
+        return self.latent_shape
+
+    def predict_eps_and_sample(self, z_t, timestep, guidance_scale):
+        return None, self.predict_sample()
 
 
 class DiffusionStudent(DiffusionPipeline):
@@ -68,149 +77,50 @@ class SDLoRAStudent(DiffusionStudent):
 
 
 
-class SevaStudent:
-    def __init__(self, device, value_dict):
-        self.device = device
-        self.model = SGMWrapper(load_model(device="cpu", verbose=True)).to(self.device)
-        # loading to cpu to save memory
-        self.ae = AutoEncoder(chunk_size=1).to("cpu")
-        self.conditioner = CLIPConditioner().to("cpu")
-        self.discretization = DDPMDiscretization()
-        self.denoiser = DiscreteDenoiser(discretization=self.discretization, num_idx=1000, device=device)
-        self.guider = MultiviewCFG(cfg_min=1.2) # from seva demo.py
-        self.version_dict = {
-            "H": 576,
-            "W": 576,
-            "T": 21,
-            "C": 4,
-            "f": 8,
-            "options": {},
-        }
+class SevaStudent(SevaPipeline):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
 
-        self.value_dict = value_dict
-
-        self.c, self.uc, self.additional_model_inputs, self.additional_sampler_inputs = self.prepare_model_inputs()
-
-        self.model.train()
-        self.set_model_requires_grad()
-
+    @override
     def set_model_requires_grad(self):
         self.model.requires_grad_(True)
-
-    def get_latent_shape(self):
-        return [self.version_dict["T"],self.version_dict["C"],
-                self.version_dict["H"] // self.version_dict["f"], self.version_dict["W"] // self.version_dict["f"]] # [21, 4, 72, 72] 
-
-    def prepare_model_inputs(self):
-        """
-        adapted from seva's eval.py do_sample function.
-        """
-        
-        imgs = self.value_dict["cond_frames"].to(self.device)
-        input_masks = self.value_dict["cond_frames_mask"].to(self.device)
-        pluckers = self.value_dict["plucker_coordinate"].to(self.device)
-
-        T = self.version_dict["T"]
-
-        encoding_t = 1 # not sure what that is
-        with torch.inference_mode():
-            self.ae = self.ae.to(self.device)
-            self.conditioner = self.conditioner.to(self.device)
-
-            input_latents = self.ae.encode(imgs[input_masks], encoding_t)
-            latents = torch.nn.functional.pad(
-                input_latents, (0, 0, 0, 0, 0, 1), value=1.0
-            )
-            c_crossattn = repeat(self.conditioner(imgs[input_masks]).mean(0), "d -> n 1 d", n=T)
-            uc_crossattn = torch.zeros_like(c_crossattn)
-            c_replace = latents.new_zeros(T, *latents.shape[1:])
-            c_replace[input_masks] = latents
-            uc_replace = torch.zeros_like(c_replace)
-            c_concat= torch.cat(
-                [
-                    repeat(
-                        input_masks,
-                        "n -> n 1 h w",
-                        h=pluckers.shape[2],
-                        w=pluckers.shape[3],
-                    ),
-                    pluckers,
-                ],
-                1,
-            )
-            uc_concat = torch.cat(
-                [pluckers.new_zeros(T, 1, *pluckers.shape[-2:]), pluckers], 1
-            )
-            c_dense_vector = pluckers
-            uc_dense_vector = c_dense_vector
-            c = {
-                "crossattn": c_crossattn,
-                "replace": c_replace,
-                "concat": c_concat,
-                "dense_vector": c_dense_vector,
-            }
-            uc = {
-                "crossattn": uc_crossattn,
-                "replace": uc_replace,
-                "concat": uc_concat,
-                "dense_vector": uc_dense_vector,
-            }
-            unload_model(self.ae)
-            unload_model(self.conditioner)
-
-            additional_model_inputs = {"num_frames": T}
-            additional_sampler_inputs = {
-                "c2w": self.value_dict["c2w"].to("cuda"),
-                "K": self.value_dict["K"].to("cuda"),
-                "input_frame_mask": self.value_dict["cond_frames_mask"].to("cuda")
-            }
-
-            return c, uc, additional_model_inputs, additional_sampler_inputs
 
     def get_trainable_parameters(self):
         return self.model.parameters()
 
-    def noise_to_timestep(self, z0, timestep, eps):
-        raise NotImplementedError # I think this function is not needed for a student
 
-    def prepare_input_for_denoiser(self, z_t, sigma):
-        input, sigma, c = self.guider.prepare_inputs(z_t, sigma, self.c, self.uc)
-        return input, sigma, c
+class SevaFrozenMVTransformerStudent(SevaPipeline):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @override
+    def set_model_requires_grad(self):
+        self.model.requires_grad_(True)
+
+        # Ensure MultiViewTransformer params remain frozen
+        for block in self.model.module.input_blocks:
+            for layer in block:
+                if layer.__class__.__name__ == "MultiviewTransformer":
+                    #print(f"Freezing kayer: {layer}")
+                    for param in layer.parameters():
+                        param.requires_grad = False
     
-    def get_sigma_from_timestep(self, timestep):
-        return self.denoiser.idx_to_sigma(timestep.to(dtype=torch.int))
+        for layer in self.model.module.middle_block:
+            if layer.__class__.__name__ == "MultiviewTransformer":
+                #print(f"Freezing layer: {layer}")
+                for param in layer.parameters():
+                    param.requires_grad = False
 
-    def predict_eps_and_sample(self, z_t, timestep, guidance_scale):        
-        sigma_orig = self.get_sigma_from_timestep(timestep)
-        input, sigma, c = self.prepare_input_for_denoiser(z_t, sigma_orig)
-        
-        pred_z0_c_and_uc = self.denoiser(self.model, input, sigma, c.copy(), **self.additional_model_inputs)
+        for block in self.model.module.output_blocks:
+            for layer in block:
+                if layer.__class__.__name__ == "MultiviewTransformer":
+                    #print(f"Freezing layer: {layer}")
+                    for param in layer.parameters():
+                        param.requires_grad = False
 
-        # logic taken from seva's DiscreteDenoiser __call__() method, 
-        # here we isolate the network output (which is the predicted noise) from the denoiser's return value.
-        sigma = append_dims(sigma, input.ndim)
-        if "replace" in c: # for input frames (mask = True) use the clean latents
-            x, mask = c.pop("replace").split((input.shape[1], 1), dim=1)
-            input = input * (1 - mask) + x * mask
-        c_skip, c_out, _, _ = self.denoiser.scaling(sigma)
-        pred_eps_c_and_uc = (input * c_skip - pred_z0_c_and_uc) / c_out
-
-        pred_z0 = self.guider(pred_z0_c_and_uc, sigma_orig, guidance_scale, **self.additional_sampler_inputs)
-        pred_eps = self.guider(pred_eps_c_and_uc, sigma_orig, guidance_scale, **self.additional_sampler_inputs)
-
-       
-        return pred_eps, pred_z0
-
-
-    @torch.no_grad()
-    def decode(self, latent):
-        self.ae.to(self.device)
-        samples = self.ae.decode(latent, 1)
-        samples = (((samples.permute((0,2,3,1)) + 1) / 2.0)* 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
-        unload_model(self.ae)
-
-        return samples
-
+                    
+    def get_trainable_parameters(self):
+        return (p for n, p in self.model.named_parameters() if p.requires_grad)
 
 
 class SevaLoRAStudent(SevaStudent):
@@ -225,7 +135,8 @@ class SevaLoRAStudent(SevaStudent):
         for _, param in first_layer.named_parameters():
             param.requires_grad = True
         
-        self.model_lora_params, _ = inject_trainable_lora(self.model)
+        self.model_lora_params, names = inject_trainable_lora_extended(self.model, target_replace_module=["TimestepEmbedSequential", "Sequential", "ResBlock", "Upsample", "MultiviewTransformer", "Downsample"])
+        print(f"Lora layers: {names}")
 
     @override
     def get_trainable_parameters(self):
@@ -234,10 +145,14 @@ class SevaLoRAStudent(SevaStudent):
    
 
 def get_mv_student(student_name, **kwargs):
+    if student_name == "blank_canvas":
+        return BlankCanvasStudent(device=kwargs["device"], latent_shape=kwargs["latent_shape"])
     if student_name == "seva":
-        return SevaStudent(**kwargs)
+        return SevaStudent(device=kwargs["device"], value_dict=kwargs["value_dict"], do_compile=kwargs["do_compile"])
+    elif student_name == "seva_frozen_mv_transformer":
+        return SevaFrozenMVTransformerStudent(device=kwargs["device"], value_dict=kwargs["value_dict"], do_compile=kwargs["do_compile"])
     elif student_name == "seva_lora":
-        return SevaLoRAStudent(**kwargs)   
+        return SevaLoRAStudent(device=kwargs["device"], value_dict=kwargs["value_dict"], do_compile=kwargs["do_compile"])  
     else:
         raise ValueError(f"Unknown multiview student name: {student_name}")
 

@@ -42,9 +42,9 @@ def show_output_log(wandb, model):
     ncols = len(output_log["z"])
     fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(11, 3))
     for col_i in range(ncols):
-        axs[0][col_i].imshow(model.decode(output_log["z"][col_i]))
-        axs[1][col_i].imshow(model.decode(output_log["z_t"][col_i]))
-        axs[2][col_i].imshow(model.decode(output_log["pred_z0"][col_i]))
+        axs[0][col_i].imshow(model.decode(output_log["z"][col_i])[0])
+        axs[1][col_i].imshow(model.decode(output_log["z_t"][col_i])[0])
+        axs[2][col_i].imshow(model.decode(output_log["pred_z0"][col_i])[0])
 
         [axs[row_i][col_i].set_xticks([]) for row_i in range(nrows)]
         [axs[row_i][col_i].set_yticks([]) for row_i in range(nrows)]
@@ -81,63 +81,58 @@ def image_optimization(teacher, text_target, num_iters, guidance_scale, lr, do_m
     wb.log_code()
     show_interval = int(num_iters / 10)
 
-    latent_shape = (1,4,64,64)
+    latent_shape = (1,3,512,512) #(1,4,64,64) # 
+
+    t_max = 999 # 950
+    t_min = 999 #50
 
     student = students.BlankCanvasStudent(latent_shape=latent_shape, device=device)
 
     text_embeddings = torch.stack([teacher.get_text_embeddings(""), teacher.get_text_embeddings(text_target)], dim=1)
     optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
-
-    if do_mask_and_flip:
-        masks = get_masks(latent_shape)
-    else:
-        mask = None
+ 
+    loss_name = "sds_latent"
+    loss_f = losses.get_loss_f(loss_name)
 
     for i in range(num_iters):
         z0_student = student.predict_sample()
         z0_student_orig = z0_student.clone()
 
-        eps = torch.randn(latent_shape, device=device)
+        eps = torch.randn((1,4,64,64), device=device, dtype=torch.float16)
 
-        if do_mask_and_flip:
-            mask_i = torch.randint(0, len(masks), size=(1,)).item()
-            mask = masks[mask_i]
-            z0_student = z0_student * mask
-            z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
-
-        # WIP! multiple predictions in batch dim
-        # preds_student = []
-        # for mask in masks:
-        #     z0_student = z0_student_orig * mask
-        #     z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
-        #     preds_student.append(z0_student)
-        # preds_student = torch.cat(preds_student, dim=0)
-        # mask = torch.cat(masks, dim=0)
-
-        timestep = torch.randint(low=50, high=950,size=(latent_shape[0],), device=device, dtype=torch.long)
+        timestep = torch.randint(low=t_min, high=t_max+1,size=(latent_shape[0],), device=device, dtype=torch.long)
 
         w_t = 1
-        loss, z_t, pred_z0 = losses.get_sds_loss(z0_student, teacher, text_embeddings, guidance_scale, eps, timestep, w_t, mask)
+        loss, z_t, pred_z0, student_z0_teacher_space = loss_f(z0_student, teacher, text_embeddings, guidance_scale, eps, timestep, w_t)
+        #loss, z_t, pred_z0 = loss_f(z0_student, teacher, text_embeddings, guidance_scale, eps, timestep, w_t)
         optimizer.zero_grad()
         loss.backward()
+
+        total_norm = torch.nn.utils.clip_grad_norm_(student.get_trainable_parameters(), max_norm=1.0)
+        print("Total gradient norm: {:.4f}".format(total_norm))
+
         optimizer.step()
+
         wb.log({"loss": loss})
         wb.log({"lr": optimizer.param_groups[0]['lr']})
         if (i+ 1) % 50 == 0:
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
 
-        if i % show_interval == 0:
-            output_log["z"].append(z0_student_orig.clone().detach())
-            output_log["z_t"].append(z_t.detach())
-            output_log["pred_z0"].append(pred_z0.detach())
-            output_log["t"].append(timestep.item())
+        with torch.no_grad():
+            if i % show_interval == 0:
+                output_log["z"].append(z0_student_orig.clone().detach())
+                output_log["z_t"].append(z_t.detach())
+                output_log["pred_z0"].append(pred_z0.detach())
+                output_log["t"].append(timestep.item())
 
-            wb.log({"z": wandb.Image(teacher.decode(z0_student_orig.detach()), caption="z(t={})".format(timestep.item()))})
-            wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach()), caption="z_t(t={})".format(timestep.item()))})
-            wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
+                wb.log({"z": wandb.Image(teacher.decode(student_z0_teacher_space.detach())[0], caption="z(t={})".format(timestep.item()))})
+                #wb.log({"z": wandb.Image(teacher.decode(z0_student_orig.detach())[0], caption="z(t={})".format(timestep.item()))})
+                #wb.log({"z": wandb.Image(z0_student_orig.detach()[0], caption="z(t={})".format(timestep.item()))})
+                wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach())[0], caption="z_t(t={})".format(timestep.item()))})
+                wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach())[0], caption="pred_z0(t={})".format(timestep.item()))})
 
-            out = teacher.decode(z0_student_orig)
-            plt.imshow(out); plt.show(block=False)
+                # out = teacher.decode(z0_student_orig)
+                # plt.imshow(out); plt.show(block=False)
     show_output_log(wb, teacher)
 
 
@@ -154,7 +149,7 @@ def turbo_sd(teacher, text_target, num_iters, guidance_scale, lr, do_mask_and_fl
     show_interval = int(num_iters / 10)
     latent_shape = (1, 4, 64, 64)
 
-    student = students.SDStudent(model_id="stabilityai/sd-turbo", device=device, dtype=torch.float32)
+    student = students.SDStudent(model_id="stabilityai/sd-turbo", device=device, dtype=torch.float16)
     teacher_embeddings = torch.stack([teacher.get_text_embeddings(""), teacher.get_text_embeddings(text_target)], dim=1)
     student_embeddings = torch.stack([student.get_text_embeddings(""), student.get_text_embeddings("")], dim=1) # embeddings should be identical
 
@@ -162,7 +157,7 @@ def turbo_sd(teacher, text_target, num_iters, guidance_scale, lr, do_mask_and_fl
 
     t_min = 200
     t_max = 999
-    z_T = torch.randn(latent_shape, device=device, dtype=torch.float32)
+    z_T = torch.randn(latent_shape, device=device, dtype=torch.float16)
     T = torch.stack([torch.tensor(t_max)] * latent_shape[0], dim=0).to(device)
 
     if do_mask_and_flip:
@@ -232,12 +227,14 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_guidance_
     timestep = T.clone()
     eta_0 = eta
 
-    if do_mask_and_flip:
-        masks = get_masks(z_t.shape)
-    else:
-        mask = None
+    loss_name = "mse_pixels"
+    loss_f = losses.get_loss_f(loss_name)
+
+    scaler = torch.cuda.amp.GradScaler()
 
     for i in range(num_iters):
+        optimizer.zero_grad()
+
         # prev timestep prediction
         with torch.no_grad():
             eps_t, pred_z0 = student.predict_eps_and_sample(z_t, timestep, student_guidance_scale, student_text_embeddings)
@@ -253,13 +250,6 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_guidance_
         eps_pred, z0_student = student.predict_eps_and_sample(z_t, timestep, student_guidance_scale, student_text_embeddings)
         z0_student_orig = z0_student.clone().detach()
 
-        if do_mask_and_flip:
-            mask_i = torch.randint(0, len(masks), size=(1,)).item()
-            mask = masks[mask_i]
-            z0_student = z0_student * mask
-            z0_student = z0_student + torch.flip(z0_student, dims=(-1,))
-            # eps_pred = eps_pred * mask
-            # eps_pred = eps_pred + torch.flip(eps_pred, dims=(-1,))
 
 
         # adding stochasticity to the predicted noise, according to Eq. 12, 16 in https://arxiv.org/pdf/2010.02502 (DDIM paper).
@@ -272,40 +262,61 @@ def ddim_like_optimization_loop(optimizer, num_iters, student, student_guidance_
         # else:
         #     eps = eps_pred
 
-        if eta_0 > 0:
-            eta = np.exp(-20 * (i / num_iters)) * eta_0
-            eps = ((1 - eta) ** 0.5) * eps_pred + (eta ** 0.5) * torch.randn_like(eps_pred)
-        else:
-            eps = eps_pred
+        # if eta_0 > 0:
+        #     eta = np.exp(-20 * (i / num_iters)) * eta_0
+        #     eps = ((1 - eta) ** 0.5) * eps_pred + (eta ** 0.5) * torch.randn_like(eps_pred)
+        # else:
+        #     eps = eps_pred
+
+        #eps = ((1 - eta_0) ** 0.5) * eps_pred + (eta_0 ** 0.5) * torch.randn_like(eps_pred)
+
+        eps = torch.randn_like(eps_pred)
 
         i_target = torch.randint(0, len(teacher_texts_embeddings), size=(1,)).item()
         w_t = 1
-        loss, z_t, pred_z0 = losses.get_sds_loss(z0_student, teacher, teacher_texts_embeddings[i_target],
-                                                           teacher_guidance_scale, eps, timestep, w_t, mask)
+        if loss_name != "sds":
+            x0_student = student.decode(z0_student, "torch", do_postprocess=False)
+            loss, z_t, pred_z0, student_z0_teacher_space = loss_f(x0_student, teacher, teacher_texts_embeddings[i_target],
+                                                           teacher_guidance_scale, eps, timestep, w_t, n_inv_iters=50)
+        else:
+            loss, z_t, pred_z0, student_z0_teacher_space = loss_f(z0_student, teacher, teacher_texts_embeddings[i_target],
+                                                           teacher_guidance_scale, eps, timestep, w_t)
         gc.collect()
         torch.cuda.empty_cache()
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+
+        # Unscales the gradients of optimizer's assigned params in-place
+        scaler.unscale_(optimizer)
+
+        params = [p for group in optimizer.param_groups for p in group['params']]
+        total_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+        print("Total gradient norm: {:.4f}".format(total_norm))
+
+        scaler.step(optimizer)
+
+        scaler.update()
 
         wb.log({"loss": loss})
         wb.log({"lr": optimizer.param_groups[0]['lr']})
-        if (i + 1) % 50 == 0:
+        if (i + 1) % 1 == 0:
             print("iteration: {}/{}, loss: {}".format(i + 1, num_iters, loss.item()))
-        if ((i % show_interval) == 0) or (i == (num_iters - 1)):
-            output_log["z"].append(z0_student_orig.detach())
-            output_log["z_t"].append(z_t.detach())
-            output_log["pred_z0"].append(pred_z0.detach())
-            output_log["t"].append(timestep.item())
 
-            wb.log({"z": wandb.Image(student.decode(z0_student_orig.detach()), caption="z(t={})".format(timestep.item()))})
-            wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach()), caption="z_t(t={})".format(timestep.item()))})
-            wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach()), caption="pred_z0(t={})".format(timestep.item()))})
+        with torch.no_grad():
+            if ((i % show_interval) == 0) or (i == (num_iters - 1)):
+                output_log["z"].append(z0_student_orig[0].detach())
+                output_log["z_t"].append(z_t.detach())
+                output_log["pred_z0"].append(pred_z0.detach())
+                output_log["t"].append(timestep.item())
 
-            out = student.decode(z0_student_orig)
-            plt.imshow(out);
-            plt.show(block=False)
+                #wb.log({"z": wandb.Image(student.decode(z0_student_orig.detach())[0], caption="z(t={})".format(timestep.item()))})
+                wb.log({"z": wandb.Image(student.decode(student_z0_teacher_space.detach())[0], caption="z(t={})".format(timestep.item()))})
+                wb.log({"z_t": wandb.Image(teacher.decode(z_t.detach().to(dtype=teacher.dtype))[0], caption="z_t(t={})".format(timestep.item()))})
+                wb.log({"pred_z0": wandb.Image(teacher.decode(pred_z0.detach().to(dtype=teacher.dtype))[0], caption="pred_z0(t={})".format(timestep.item()))})
+
+                #out = student.decode(z0_student_orig)
+                #plt.imshow(out);
+                #plt.show(block=False)
 
     show_output_log(wb, student)
 
@@ -317,20 +328,21 @@ def SD(teacher, texts_target, num_iters, guidance_scale, student_guidance_scale,
               "teacher_name": teacher_name}
     wb = wandb.init(
         project="3dips",
-        name="SD",
+        name="SD-sds-pixels",
         config=config
     ); wb.log_code()
     show_interval = int(num_iters / 10)
 
     latent_shape = (1, 4, 64, 64)
 
-    student = students.SDStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    #student = students.SDStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float16)
+    student = students.SDStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32) # mixed precision with gradient scaling requires float32 weights
 
     optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
     t_min = 20
     t_max = 999
 
-    z_t = torch.randn(latent_shape, device=device, dtype=torch.float32, requires_grad=False)
+    z_t = torch.randn(latent_shape, device=device, dtype=torch.float16, requires_grad=False)
     ddim_like_optimization_loop(optimizer, num_iters, student, student_guidance_scale,
                                 teacher, texts_target, guidance_scale, t_min, t_max, z_t, eta,
                                 show_interval, wb, do_mask_and_flip)
@@ -350,20 +362,20 @@ def SD_lora(teacher, texts_target, num_iters, guidance_scale, student_guidance_s
 
     show_interval = int(num_iters / 10)
     latent_shape = (1, 4, 64, 64)
-    student = students.SDLoRAStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float32)
+    student = students.SDLoRAStudent(model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float16)
 
     optimizer = SGD(params=student.get_trainable_parameters(), lr=lr)
     t_min = 20
     t_max = 999
 
-    z_t = torch.randn(latent_shape, device=device, dtype=torch.float32, requires_grad=False)
+    z_t = torch.randn(latent_shape, device=device, dtype=torch.float16, requires_grad=False)
     ddim_like_optimization_loop(optimizer, num_iters, student, student_guidance_scale,
                                 teacher, texts_target, guidance_scale, t_min, t_max, z_t, eta,
                                 show_interval, wb, do_mask_and_flip)
 
 def get_masks(shape):
-    mask1 = torch.ones(shape, dtype=torch.float32, device=device)
-    mask2 = torch.ones(shape, dtype=torch.float32, device=device)
+    mask1 = torch.ones(shape, dtype=torch.float16, device=device)
+    mask2 = torch.ones(shape, dtype=torch.float16, device=device)
     mask1[..., :(shape[-1] // 2)] = 0.0
     mask2[..., (shape[-1] // 2):] = 0.0
 
@@ -399,7 +411,17 @@ if __name__ == '__main__':
     num_iterations = args.num_iterations
     do_mask_and_flip = args.do_mask_and_flip
     student_name = args.student_name
-    teacher, teachers_prompt = get_teacher(teacher_name)
+    
+    # teacher = teachers.get_teacher(teacher_name, device=device)
+    gt_image = [PIL.Image.open("seva/weka/home-jensen/reve/datasets/reconfusion_export/co3d-viewcrafter/car/images/frame000012.jpg").convert("RGB").resize((512, 512))]
+    teacher = teachers.get_teacher(teacher_name, device=device, gt_images=gt_image)
+    teachers_prompt = [""]
+
+
+    if teacher_name == "oracle":
+        gt_image = [PIL.Image.open("example_img.png").convert("RGB").resize((512, 512))]
+        teachers_prompt = ["a dog sitting on a bench"]
+        teacher = teachers.OracleTeacher(gt_images=gt_image, model_id="stabilityai/stable-diffusion-2-1", device=device, dtype=torch.float16)
 
     train_student(student_name, teacher, teachers_prompt, lr, num_iterations, do_mask_and_flip, teacher_name)
 
