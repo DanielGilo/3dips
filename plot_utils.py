@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import torch
 import numpy as np
+import wandb
 
 def plot_frames_row(frames, wb, figlabel, caption):
     nrows = 1
@@ -22,7 +23,7 @@ def plot_frames_row(frames, wb, figlabel, caption):
     plt.close()
 
 
-def plot_frames(frames, wb, figlabel, caption, ncols=5):
+def plot_frames(frames, wb, figlabel, caption, ncols=5, save_as_pdf=False, save_individual_pngs=False, save_dir="tmp_outputs"):
     """
     Plots the given frames in multiple rows with a specified number of columns.
 
@@ -44,6 +45,13 @@ def plot_frames(frames, wb, figlabel, caption, ncols=5):
         axs[i].set_xticks([])
         axs[i].set_yticks([])
 
+        if save_individual_pngs:
+            # Save individual frame as PNG and log to wandb
+            tmp_fname = f"{save_dir}/{figlabel}_frame_{i}.png"
+            plt.imsave(tmp_fname, frame)
+            if wb is not None:
+                wb.log({f"{figlabel}_frame_{i}": wandb.Image(tmp_fname)})
+
     # Hide unused axes
     for i in range(len(frames), len(axs)):
         axs[i].axis("off")
@@ -51,7 +59,15 @@ def plot_frames(frames, wb, figlabel, caption, ncols=5):
     axs[0].set_ylabel(caption)
 
     plt.tight_layout()
-    wb.log({figlabel: fig})
+    if wb is not None:
+        wb.log({figlabel:fig})
+
+    if save_as_pdf:
+        tmp_fname = "{}/{}.pdf".format(save_dir, figlabel)
+        plt.savefig(tmp_fname, dpi=300, bbox_inches='tight')
+        if wb is not None:
+            wb.save(tmp_fname)
+
     plt.close()
 
 

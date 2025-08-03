@@ -5,23 +5,26 @@ import torch
 
 # from DreamFusion appendix A1: sds_loss(x) = weight(t) * dot(stopgrad[epshat_t - eps], x) where x = g(theta)
 # and its grad is the known formula: weight(t) * (epshat_t - eps) * grad(x)
-def get_sds_loss(z0_student, teacher, text_embeddings, teacher_guidance_scale, eps, timestep, w_t, batch_s, batch_e, n_inv_iters=0):
+def get_sds_loss(z0_student, teacher, teacher_guidance_scale, eps, target_latent, timestep, w_t, eta_teacher, batch_s, batch_e, n_inv_iters=0, n_teacher_iters=1):
     with torch.inference_mode():
         if n_inv_iters > 0:
-            z_t = teacher.invert_to_timestep(z0_student, teacher_guidance_scale, text_embeddings, timestep, n_inv_iters, batch_s, batch_e)
+            z_t = teacher.noise_to_timestep_using_inversion(z0_student, teacher_guidance_scale, timestep.item(), n_inv_iters, batch_s, batch_e)
         else:
             z_t = teacher.noise_to_timestep(z0_student, timestep, eps)
-        if text_embeddings is not None:
-            e_t, pred_z0 = teacher.predict_eps_and_sample(z_t, timestep, teacher_guidance_scale, text_embeddings, batch_s, batch_e)
-        else:
-            e_t, pred_z0 = teacher.predict_eps_and_sample(z_t, timestep)
+       
+        if target_latent is None:
+            #e_t, pred_z0 = teacher.predict_eps_and_sample(z_t, timestep, teacher_guidance_scale, text_embeddings, batch_s, batch_e)
+            e_t, pred_z0 = teacher.multi_step_sample(z_t, teacher_guidance_scale, timestep.item(), n_teacher_iters, batch_s, batch_e, eta_teacher)
+        else: #TODO: move to teacher implementation!! this is not correct for all teachers
+            pred_z0 = target_latent
+            e_t = (z_t - teacher.alphas[timestep.item()] * pred_z0) / teacher.sigmas[timestep.item()]
         
         grad_z = w_t * (e_t - eps)
-        #assert torch.isfinite(grad_z).all()
         grad_z = torch.nan_to_num(grad_z.detach(), 0.0, 0.0, 0.0)
     sds_loss = grad_z.clone() * z0_student
+    sds_loss = sds_loss / z0_student.numel() # Daniel: normalization is necessary to avoid exploding grads
     del grad_z
-    sds_loss = sds_loss.sum() / z0_student.numel() # Daniel: normalization is necessary to avoid exploding grads
+    sds_loss = sds_loss.sum() 
 
     return sds_loss, z_t, pred_z0, z0_student
 
